@@ -1,0 +1,12 @@
+[package]
+name = "hermes-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hermes-cfg = { path = "../hermes-cfg" }
+tokio = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

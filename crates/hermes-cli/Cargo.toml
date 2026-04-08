@@ -1,0 +1,29 @@
+[package]
+name = "hermes-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "hermes"
+path = "src/main.rs"
+
+[dependencies]
+hermes-cfg = { path = "../hermes-cfg" }
+hermes-core = { path = "../hermes-core" }
+hermes-agent = { path = "../hermes-agent" }
+hermes-tools = { path = "../hermes-tools" }
+hermes-llm = { path = "../hermes-llm" }
+hermes-terminal = { path = "../hermes-terminal" }
+hermes-skill = { path = "../hermes-skill" }
+hermes-mcp = { path = "../hermes-mcp" }
+hermes-cron = { path = "../hermes-cron" }
+hermes-gateway = { path = "../hermes-gateway" }
+hermes-ui = { path = "../hermes-ui" }
+hermes-security = { path = "../hermes-security" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

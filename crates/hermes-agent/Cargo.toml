@@ -1,0 +1,21 @@
+[package]
+name = "hermes-agent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hermes-cfg = { path = "../hermes-cfg" }
+hermes-core = { path = "../hermes-core" }
+hermes-llm = { path = "../hermes-llm" }
+hermes-tools = { path = "../hermes-tools" }
+hermes-mcp = { path = "../hermes-mcp" }
+hermes-skill = { path = "../hermes-skill" }
+hermes-cron = { path = "../hermes-cron" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "hermes-terminal"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hermes-cfg = { path = "../hermes-cfg" }
+hermes-security = { path = "../hermes-security" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

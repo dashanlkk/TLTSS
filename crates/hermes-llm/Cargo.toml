@@ -1,0 +1,17 @@
+[package]
+name = "hermes-llm"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hermes-cfg = { path = "../hermes-cfg" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+eventsource-stream = "0.2"
+async-stream = "0.3"

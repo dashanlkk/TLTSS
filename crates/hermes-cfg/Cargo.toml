@@ -1,0 +1,14 @@
+[package]
+name = "hermes-cfg"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+schemars = { workspace = true }
+futures = { workspace = true }
