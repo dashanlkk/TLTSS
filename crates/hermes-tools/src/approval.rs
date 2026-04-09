@@ -65,3 +65,40 @@ impl ApprovalManager {
         self.pending.read().await.keys().cloned().collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_set_and_get_level() {
+        let mgr = ApprovalManager::new();
+        assert!(matches!(mgr.get_level("tool_a").await, ApprovalLevel::AutoApprove));
+        mgr.set_level("tool_a", ApprovalLevel::RequireApproval).await;
+        assert!(matches!(mgr.get_level("tool_a").await, ApprovalLevel::RequireApproval));
+    }
+
+    #[tokio::test]
+    async fn test_approve_flow() {
+        let mgr = ApprovalManager::new();
+        let rx = mgr.request_approval("call_1").await;
+        assert!(mgr.pending_ids().await.contains(&"call_1".to_string()));
+        mgr.approve("call_1").await;
+        assert_eq!(rx.await.unwrap(), true);
+        assert!(mgr.pending_ids().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reject_flow() {
+        let mgr = ApprovalManager::new();
+        let rx = mgr.request_approval("call_2").await;
+        mgr.reject("call_2").await;
+        assert_eq!(rx.await.unwrap(), false);
+    }
+
+    #[tokio::test]
+    async fn test_approve_nonexistent() {
+        let mgr = ApprovalManager::new();
+        assert!(!mgr.approve("nonexistent").await);
+    }
+}

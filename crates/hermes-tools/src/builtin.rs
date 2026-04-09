@@ -191,3 +191,81 @@ impl ToolHandler for ListDirTool {
         Ok(ToolResult::success("list_dir", entries.join("\n")))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hermes_cfg::platform::SessionSource;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new("test-session", SessionSource::cli())
+    }
+
+    #[tokio::test]
+    async fn test_read_file_tool() {
+        let dir = std::env::temp_dir();
+        let file_path = dir.join("hermes_test_read.txt");
+        std::fs::write(&file_path, "hello world").unwrap();
+
+        let tool = ReadFileTool::new(&dir);
+        let args = serde_json::json!({"path": "hermes_test_read.txt"}).to_string();
+        let result = tool.execute(&args, &test_ctx()).await.unwrap();
+        assert!(result.content.contains("hello world"));
+        assert!(!result.is_error);
+
+        std::fs::remove_file(&file_path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_read_file_traversal_blocked() {
+        let dir = std::env::temp_dir();
+        let tool = ReadFileTool::new(&dir);
+        let args = serde_json::json!({"path": "../../../etc/passwd"}).to_string();
+        let result = tool.execute(&args, &test_ctx()).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_tool() {
+        let dir = std::env::temp_dir().join("hermes_test_write");
+        std::fs::create_dir_all(&dir).ok();
+
+        let tool = WriteFileTool::new(&dir);
+        let args = serde_json::json!({"path": "test_out.txt", "content": "written content"}).to_string();
+        let result = tool.execute(&args, &test_ctx()).await.unwrap();
+        assert!(!result.is_error);
+
+        let written = std::fs::read_to_string(dir.join("test_out.txt")).unwrap();
+        assert_eq!(written, "written content");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_tool() {
+        let dir = std::env::temp_dir().join("hermes_test_list");
+        std::fs::create_dir_all(&dir).ok();
+        std::fs::write(dir.join("a.txt"), "a").ok();
+        std::fs::write(dir.join("b.txt"), "b").ok();
+
+        let tool = ListDirTool::new(&dir);
+        let args = serde_json::json!({"path": "."}).to_string();
+        let result = tool.execute(&args, &test_ctx()).await.unwrap();
+        assert!(result.content.contains("a.txt"));
+        assert!(result.content.contains("b.txt"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_tool() {
+        let terminal = Arc::new(
+            hermes_terminal::backend::LocalBackend::new(std::env::temp_dir())
+        );
+        let tool = ExecuteCommandTool::new(terminal);
+        let cmd = if cfg!(target_os = "windows") { "echo hello" } else { "echo hello" };
+        let args = serde_json::json!({"command": cmd}).to_string();
+        let result = tool.execute(&args, &test_ctx()).await.unwrap();
+        assert!(result.content.contains("hello"));
+    }
+}

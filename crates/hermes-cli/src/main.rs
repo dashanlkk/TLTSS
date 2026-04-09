@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
+use hermes_agent::Agent;
 use hermes_core::config::AppConfig;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -126,12 +126,9 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_chat(tui: bool) -> anyhow::Result<()> {
     use hermes_agent::{Agent, MemoryStore};
+    use hermes_cfg::traits::LlmClient;
     use hermes_llm::FakeClient;
     use hermes_tools::ToolRegistry;
-    use hermes_cfg::traits::LlmClient;
-
-    println!("Hermes Agent v0.1.0");
-    println!("Type 'exit' to quit.\n");
 
     let llm: Arc<dyn LlmClient> = Arc::new(FakeClient::new("Hello! I'm Hermes. How can I help you?"));
     let registry = Arc::new(ToolRegistry::new());
@@ -145,33 +142,76 @@ async fn run_chat(tui: bool) -> anyhow::Result<()> {
     );
 
     if tui {
-        println!("TUI mode not yet implemented. Running in plain mode.\n");
+        run_tui_chat(agent).await
+    } else {
+        run_reedline_chat(agent).await
     }
+}
 
-    // Simple REPL
-    let mut input = String::new();
+/// TUI 模式：使用 ratatui 界面
+async fn run_tui_chat(agent: Agent) -> anyhow::Result<()> {
+    let mut app = hermes_ui::TuiApp::new();
+    app.add_message("System", "Welcome to Hermes! Type a message and press Enter.");
+
+    let agent_ref = std::sync::Arc::new(tokio::sync::Mutex::new(agent));
+    hermes_ui::render::run_tui(&mut app, |input| {
+        let agent = agent_ref.clone();
+        let input = input.to_string();
+        // 同步调用异步 Agent（TUI 回调是同步的，需要 block）
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async {
+            let agent = agent.lock().await;
+            agent
+                .chat(&input, hermes_cfg::platform::SessionSource::cli())
+                .await
+                .ok()
+                .map(|msg| msg.content)
+        })
+    })?;
+
+    Ok(())
+}
+
+/// Reedline 模式：带历史和自动补全的交互式 CLI
+async fn run_reedline_chat(agent: Agent) -> anyhow::Result<()> {
+    use reedline::{DefaultPrompt, Reedline, Signal};
+
+    println!("Hermes Agent v0.1.0");
+    println!("Type 'exit' to quit.\n");
+
+    let mut line_editor = Reedline::create();
+    let prompt = DefaultPrompt::default();
+
     loop {
-        print!("> ");
-        use std::io::Write;
-        std::io::stdout().flush()?;
+        let sig = line_editor.read_line(&prompt);
+        match sig {
+            Ok(Signal::Success(buffer)) => {
+                let trimmed = buffer.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed == "exit" || trimmed == "quit" {
+                    println!("Goodbye!");
+                    break;
+                }
 
-        input.clear();
-        if std::io::stdin().read_line(&mut input).is_err() {
-            break;
-        }
-
-        let trimmed = input.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed == "exit" || trimmed == "quit" {
-            println!("Goodbye!");
-            break;
-        }
-
-        match agent.chat(trimmed, hermes_cfg::platform::SessionSource::cli()).await {
-            Ok(msg) => println!("{}\n", msg.content),
-            Err(e) => eprintln!("Error: {}\n", e),
+                match agent.chat(trimmed, hermes_cfg::platform::SessionSource::cli()).await {
+                    Ok(msg) => println!("{}\n", msg.content),
+                    Err(e) => eprintln!("Error: {}\n", e),
+                }
+            }
+            Ok(Signal::CtrlC) => {
+                println!("\nGoodbye!");
+                break;
+            }
+            Ok(Signal::CtrlD) => {
+                println!("\nGoodbye!");
+                break;
+            }
+            Err(e) => {
+                eprintln!("Input error: {}", e);
+                break;
+            }
         }
     }
 

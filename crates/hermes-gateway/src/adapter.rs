@@ -1,7 +1,7 @@
 use async_trait::async_trait;
-use hermes_cfg::prelude::*;
 use hermes_cfg::traits::PlatformAdapter;
 use hermes_cfg::platform::SessionSource;
+use hermes_cfg::error::LlmError;
 
 use crate::channel::GatewayChannel;
 

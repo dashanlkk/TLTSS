@@ -1,6 +1,6 @@
 use hermes_cfg::error::SkillError;
 use crate::manifest::{SkillManifest, SkillStatus};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::info;
 use walkdir::WalkDir;
 

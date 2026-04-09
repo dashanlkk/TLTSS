@@ -1,0 +1,15 @@
+{
+  "bef47736-728c-4b32-a789-26b1b6ccc34e": {
+    "id": "bef47736-728c-4b32-a789-26b1b6ccc34e",
+    "name": "toggle",
+    "cron_expression": "0 * * * * *",
+    "payload": {
+      "Command": {
+        "command": "echo"
+      }
+    },
+    "enabled": true,
+    "max_retries": 3,
+    "created_at": "2026-04-09T01:01:19.149543200Z"
+  }
+}

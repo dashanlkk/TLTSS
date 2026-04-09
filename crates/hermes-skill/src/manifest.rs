@@ -53,6 +53,14 @@ impl SkillManifest {
         serde_yaml::to_string(self)
             .map_err(|e| SkillError::InvalidManifest(e.to_string()))
     }
+
+    /// 检查用户输入是否匹配触发模式（大小写不敏感）
+    pub fn matches(&self, input: &str) -> bool {
+        let input_lower = input.to_lowercase();
+        self.trigger_patterns.iter().any(|pattern| {
+            input_lower.contains(&pattern.to_lowercase())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -82,9 +90,41 @@ steps:
     #[test]
     fn test_invalid_manifest() {
         let yaml = "not: a\nvalid: manifest";
-        // Actually this will parse but miss required fields
         let result = SkillManifest::from_yaml(yaml);
-        // It should fail due to missing required fields
-        assert!(result.is_err() || result.unwrap().name.is_empty() == false || true);
+        // 缺少 name 字段应导致解析失败
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_trigger_match() {
+        let yaml = r#"
+name: backup_task
+version: "1.0"
+description: Backup files
+trigger_patterns:
+  - "backup"
+  - "archive"
+steps:
+  - action: execute_command
+    params: {}
+"#;
+        let manifest = SkillManifest::from_yaml(yaml).unwrap();
+        assert!(manifest.matches("please backup my files"));
+        assert!(manifest.matches("I want to archive data"));
+        assert!(!manifest.matches("hello world"));
+    }
+
+    #[test]
+    fn test_trigger_case_insensitive() {
+        let yaml = r#"
+name: test
+version: "1.0"
+description: Test
+trigger_patterns:
+  - "Hello"
+steps: []
+"#;
+        let manifest = SkillManifest::from_yaml(yaml).unwrap();
+        assert!(manifest.matches("say HELLO"));
     }
 }

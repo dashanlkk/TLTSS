@@ -27,7 +27,7 @@ impl McpClient {
         args: &[String],
     ) -> Result<Self, McpError> {
         let transport = StdioTransport::spawn(command, args).await?;
-        let mut client = Self {
+        let client = Self {
             name: name.into(),
             transport,
             tools: Vec::new(),

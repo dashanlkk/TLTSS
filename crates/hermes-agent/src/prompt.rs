@@ -1,4 +1,4 @@
-use hermes_cfg::message::{Message, Role};
+use hermes_cfg::message::Message;
 use hermes_skill::SkillManifest;
 
 /// Prompt 组装器：将系统提示、记忆、技能、对话历史组装为 messages 列表
@@ -81,6 +81,7 @@ impl PromptBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hermes_cfg::message::Role;
 
     #[test]
     fn test_prompt_build() {

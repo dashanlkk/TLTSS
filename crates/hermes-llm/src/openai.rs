@@ -122,10 +122,24 @@ impl OpenAIClient {
                     Role::Assistant => "assistant",
                     Role::Tool => "tool",
                 };
+                // 转换 tool_calls（assistant 消息可能携带工具调用）
+                let tool_calls = m.tool_calls.as_ref().map(|calls| {
+                    calls
+                        .iter()
+                        .map(|c| ApiToolCall {
+                            id: c.id.clone(),
+                            call_type: c.call_type.clone(),
+                            function: ApiFunctionCall {
+                                name: c.function.name.clone(),
+                                arguments: c.function.arguments.clone(),
+                            },
+                        })
+                        .collect()
+                });
                 ApiMessage {
                     role: role.to_string(),
                     content: m.content.clone(),
-                    tool_calls: None,
+                    tool_calls,
                     tool_call_id: m.tool_call_id.clone(),
                 }
             })

@@ -3,5 +3,7 @@
 pub mod jsonrpc;
 pub mod transport;
 pub mod client;
+pub mod adapter;
 
 pub use client::McpClient;
+pub use adapter::McpToolAdapter;

@@ -21,6 +21,11 @@ impl GatewayChannel {
         Self { tx, rx: Some(rx) }
     }
 
+    /// 从已有的 sender 创建（不带 receiver）
+    pub fn from_sender(tx: mpsc::UnboundedSender<GatewayMessage>) -> Self {
+        Self { tx, rx: None }
+    }
+
     /// 发送消息到 Agent
     pub fn send(&self, msg: GatewayMessage) -> Result<(), String> {
         self.tx.send(msg).map_err(|e| e.to_string())

@@ -48,7 +48,7 @@ mod tests {
         env::set_var("TEST_SECRET_KEY_HERMES", "super_secret_12345");
         assert!(env::var("TEST_SECRET_KEY_HERMES").is_ok());
         // Since the key isn't in SENSITIVE_KEYS, test with actual filter logic
-        let output = "my key is super_secret_12345";
+        let _output = "my key is super_secret_12345";
         // The static set doesn't include this test key, so test the filter function behavior
         env::remove_var("TEST_SECRET_KEY_HERMES");
     }

@@ -14,3 +14,6 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 cron = "0.15"
+
+[dev-dependencies]
+hermes-terminal = { path = "../hermes-terminal" }

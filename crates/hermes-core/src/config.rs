@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 /// 应用顶层配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
