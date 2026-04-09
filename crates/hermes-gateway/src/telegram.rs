@@ -238,6 +238,20 @@ impl GatewayManager {
         info!("Telegram adapter registered");
     }
 
+    /// 注册 Discord 适配器
+    pub fn with_discord(&mut self, token: &str, channel_id: &str, gateway_tx: tokio::sync::mpsc::UnboundedSender<GatewayMessage>) {
+        let adapter = crate::discord::DiscordAdapter::new(token, channel_id, gateway_tx);
+        self.adapters.push(Box::new(adapter));
+        info!("Discord adapter registered");
+    }
+
+    /// 注册 Slack 适配器
+    pub fn with_slack(&mut self, token: &str, channel_id: &str, gateway_tx: tokio::sync::mpsc::UnboundedSender<GatewayMessage>) {
+        let adapter = crate::slack::SlackAdapter::new(token, channel_id, gateway_tx);
+        self.adapters.push(Box::new(adapter));
+        info!("Slack adapter registered");
+    }
+
     /// 启动所有已注册的适配器
     pub async fn start_all(&mut self) -> Result<(), LlmError> {
         for adapter in &mut self.adapters {

@@ -56,6 +56,9 @@ schemars = "0.8"
 # UUID
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# Home directory
+dirs = "5"
+
 # Regex
 regex = "1"
 

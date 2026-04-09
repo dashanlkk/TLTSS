@@ -47,6 +47,20 @@ impl SessionSource {
             chat_id: job_id.into(),
         }
     }
+
+    pub fn discord(channel_id: impl Into<String>) -> Self {
+        Self {
+            platform: Platform::Discord,
+            chat_id: channel_id.into(),
+        }
+    }
+
+    pub fn slack(channel_id: impl Into<String>) -> Self {
+        Self {
+            platform: Platform::Slack,
+            chat_id: channel_id.into(),
+        }
+    }
 }
 
 #[cfg(test)]

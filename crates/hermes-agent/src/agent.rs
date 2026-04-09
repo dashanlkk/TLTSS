@@ -2,10 +2,12 @@ use futures::StreamExt;
 use hermes_cfg::message::Message;
 use hermes_cfg::platform::SessionSource;
 use hermes_cfg::traits::{LlmClient, StreamEvent, ToolContext};
+use hermes_skill::manifest::SkillManifest;
 use hermes_tools::ToolRegistry;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::memory::MemoryStore;
 use crate::prompt::PromptBuilder;
@@ -17,6 +19,7 @@ pub struct AgentConfig {
     pub system_prompt: String,
     pub max_tool_rounds: u32,
     pub max_context_tokens: usize,
+    pub data_dir: Option<PathBuf>,
 }
 
 impl Default for AgentConfig {
@@ -25,6 +28,7 @@ impl Default for AgentConfig {
             system_prompt: "You are Hermes, an intelligent AI assistant. You can use tools to help users.".to_string(),
             max_tool_rounds: 10,
             max_context_tokens: 8000,
+            data_dir: None,
         }
     }
 }
@@ -35,6 +39,7 @@ pub struct Agent {
     llm: Arc<dyn LlmClient>,
     registry: Arc<ToolRegistry>,
     memory: Arc<MemoryStore>,
+    skills: Vec<SkillManifest>,
     sessions: RwLock<Vec<Session>>,
     trace: Arc<TraceCollector>,
 }
@@ -51,9 +56,29 @@ impl Agent {
             llm,
             registry,
             memory,
+            skills: Vec::new(),
             sessions: RwLock::new(Vec::new()),
             trace: Arc::new(TraceCollector::new()),
         }
+    }
+
+    /// 设置技能列表
+    pub fn with_skills(mut self, skills: Vec<SkillManifest>) -> Self {
+        self.skills = skills;
+        self
+    }
+
+    /// 从持久化目录加载 sessions
+    pub async fn load_sessions(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(dir) = &self.config.data_dir {
+            let session_dir = dir.join("sessions");
+            let loaded = Session::load_all_from_dir(&session_dir).await?;
+            if !loaded.is_empty() {
+                *self.sessions.write().await = loaded;
+                info!("Loaded {} sessions from {}", self.sessions.read().await.len(), session_dir.display());
+            }
+        }
+        Ok(())
     }
 
     /// 处理用户消息，返回 Agent 回复
@@ -78,16 +103,31 @@ impl Agent {
         let user_msg = Message::new_user(user_message);
         session.push_message(user_msg.clone());
 
-        self.trace.event(&trace_id, TraceEvent::UserMessage(user_message.to_string())).await;
+        self.trace
+            .event(
+                &trace_id,
+                TraceEvent::UserMessage(user_message.to_string()),
+            )
+            .await;
+
+        // 检查技能触发
+        if let Some(skill_result) = self.try_skill_trigger(user_message, &source).await {
+            self.trace.event(&trace_id, TraceEvent::Done).await;
+            let response = Message::new_assistant(&skill_result);
+            session.push_message(response.clone());
+            self.persist_session(session).await;
+            return Ok(response);
+        }
 
         // 检索相关记忆
         let memories = self.memory.search(user_message).await;
 
         // 构建 prompt
-        let builder = PromptBuilder::new(&self.config.system_prompt)
-            .with_memories(memories);
+        let builder = PromptBuilder::new(&self.config.system_prompt).with_memories(memories);
         let messages = builder.build(&session.messages);
-        self.trace.event(&trace_id, TraceEvent::PromptBuilt(messages.len())).await;
+        self.trace
+            .event(&trace_id, TraceEvent::PromptBuilt(messages.len()))
+            .await;
 
         // Agent loop
         let mut current_messages = messages;
@@ -103,7 +143,12 @@ impl Agent {
             self.trace.event(&trace_id, TraceEvent::LlmCallStart).await;
             let tools = self.registry.tool_definitions().await;
             let response = self.llm.complete(&current_messages, &tools).await?;
-            self.trace.event(&trace_id, TraceEvent::LlmCallComplete(response.content.clone())).await;
+            self.trace
+                .event(
+                    &trace_id,
+                    TraceEvent::LlmCallComplete(response.content.clone()),
+                )
+                .await;
 
             // 检查是否有工具调用
             let tool_calls = response.tool_calls.clone();
@@ -118,7 +163,6 @@ impl Agent {
 
                 // 并行执行工具
                 let ctx = ToolContext::new(&session.id, source.clone());
-                let mut results = Vec::new();
 
                 // 使用 JoinSet 并行执行
                 let mut join_set = tokio::task::JoinSet::new();
@@ -127,43 +171,49 @@ impl Agent {
                     let ctx = ctx.clone();
                     let tool_name = call.function.name.clone();
                     join_set.spawn(async move {
-                        let result = registry.execute(&tool_name, &call.function.arguments, &ctx).await;
+                        let result = registry
+                            .execute(&tool_name, &call.function.arguments, &ctx)
+                            .await;
                         (call.id.clone(), tool_name, result)
                     });
                 }
 
                 while let Some(res) = join_set.join_next().await {
                     match res {
-                        Ok((call_id, tool_name, result)) => {
-                            match result {
-                                Ok(tool_result) => {
-                                    self.trace.event(&trace_id, TraceEvent::ToolExecuted {
-                                        tool: tool_name,
-                                        success: true,
-                                    }).await;
-                                    let msg = Message::new_tool_result(&call_id, &tool_result.content);
-                                    results.push(msg);
-                                }
-                                Err(e) => {
-                                    self.trace.event(&trace_id, TraceEvent::ToolExecuted {
-                                        tool: tool_name,
-                                        success: false,
-                                    }).await;
-                                    let msg = Message::new_tool_result(&call_id, &e.to_string());
-                                    results.push(msg);
-                                }
+                        Ok((call_id, tool_name, result)) => match result {
+                            Ok(tool_result) => {
+                                self.trace
+                                    .event(
+                                        &trace_id,
+                                        TraceEvent::ToolExecuted {
+                                            tool: tool_name,
+                                            success: true,
+                                        },
+                                    )
+                                    .await;
+                                let msg = Message::new_tool_result(&call_id, &tool_result.content);
+                                current_messages.push(msg.clone());
+                                session.push_message(msg);
                             }
-                        }
+                            Err(e) => {
+                                self.trace
+                                    .event(
+                                        &trace_id,
+                                        TraceEvent::ToolExecuted {
+                                            tool: tool_name,
+                                            success: false,
+                                        },
+                                    )
+                                    .await;
+                                let msg = Message::new_tool_result(&call_id, &e.to_string());
+                                current_messages.push(msg.clone());
+                                session.push_message(msg);
+                            }
+                        },
                         Err(e) => {
                             warn!("Tool task failed: {}", e);
                         }
                     }
-                }
-
-                // 将工具结果添加到消息列表
-                for r in &results {
-                    session.push_message(r.clone());
-                    current_messages.push(r.clone());
                 }
 
                 rounds += 1;
@@ -173,17 +223,26 @@ impl Agent {
             }
         }
 
-        // 自动保存记忆（提取本轮对话关键信息）
+        // 自动保存记忆
         if !user_message.is_empty() {
-            let _ = self.memory.add(user_message, vec![user_message.to_string()]).await;
+            let _ = self
+                .memory
+                .add(user_message, vec![user_message.to_string()])
+                .await;
         }
 
         self.trace.event(&trace_id, TraceEvent::Done).await;
-        let final_msg = session.messages.last().cloned().unwrap_or_else(|| Message::new_assistant("No response"));
+        let final_msg = session
+            .messages
+            .last()
+            .cloned()
+            .unwrap_or_else(|| Message::new_assistant("No response"));
+
+        self.persist_session(session).await;
         Ok(final_msg)
     }
 
-    /// 流式对话 — 逐 token 输出 Agent 回复
+    /// 流式对话 — 逐 token 输出 Agent 回复（支持 tool_call）
     pub async fn chat_stream(
         &self,
         user_message: &str,
@@ -204,12 +263,28 @@ impl Agent {
 
         let user_msg = Message::new_user(user_message);
         session.push_message(user_msg.clone());
-        self.trace.event(&trace_id, TraceEvent::UserMessage(user_message.to_string())).await;
+        self.trace
+            .event(
+                &trace_id,
+                TraceEvent::UserMessage(user_message.to_string()),
+            )
+            .await;
+
+        // 检查技能触发
+        if let Some(skill_result) = self.try_skill_trigger(user_message, &source).await {
+            self.trace.event(&trace_id, TraceEvent::Done).await;
+            let response = Message::new_assistant(&skill_result);
+            session.push_message(response.clone());
+            self.persist_session(session).await;
+            return Ok(response);
+        }
 
         let memories = self.memory.search(user_message).await;
         let builder = PromptBuilder::new(&self.config.system_prompt).with_memories(memories);
         let messages = builder.build(&session.messages);
-        self.trace.event(&trace_id, TraceEvent::PromptBuilt(messages.len())).await;
+        self.trace
+            .event(&trace_id, TraceEvent::PromptBuilt(messages.len()))
+            .await;
 
         // 流式调用 LLM
         let tools = self.registry.tool_definitions().await;
@@ -217,6 +292,8 @@ impl Agent {
         match self.llm.complete_stream(&messages, &tools).await {
             Ok(mut stream) => {
                 let mut full_content = String::new();
+                let mut pending_tool_calls: Vec<hermes_cfg::tool::ToolCall> = Vec::new();
+
                 while let Some(event) = stream.next().await {
                     match event {
                         Ok(StreamEvent::Delta(token)) => {
@@ -224,7 +301,21 @@ impl Agent {
                             full_content.push_str(&token);
                         }
                         Ok(StreamEvent::Done) => break,
-                        Ok(StreamEvent::ToolCall { .. }) => {} // 流式中暂不处理
+                        Ok(StreamEvent::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        }) => {
+                            debug!("Stream tool call: {} ({})", name, id);
+                            pending_tool_calls.push(hermes_cfg::tool::ToolCall {
+                                id,
+                                call_type: "function".to_string(),
+                                function: hermes_cfg::tool::FunctionCall {
+                                    name,
+                                    arguments,
+                                },
+                            });
+                        }
                         Err(e) => {
                             warn!("Stream error: {}", e);
                             break;
@@ -232,20 +323,115 @@ impl Agent {
                     }
                 }
 
-                let response = Message::new_assistant(&full_content);
+                let mut response = Message::new_assistant(&full_content);
+
+                // 处理流式中的 tool calls
+                if !pending_tool_calls.is_empty() {
+                    response = response.with_tool_calls(pending_tool_calls.clone());
+
+                    // 执行工具并收集结果
+                    let ctx = ToolContext::new(&session.id, source.clone());
+                    for call in &pending_tool_calls {
+                        match self
+                            .registry
+                            .execute(&call.function.name, &call.function.arguments, &ctx)
+                            .await
+                        {
+                            Ok(tool_result) => {
+                                let msg =
+                                    Message::new_tool_result(&call.id, &tool_result.content);
+                                session.push_message(msg);
+                                self.trace
+                                    .event(
+                                        &trace_id,
+                                        TraceEvent::ToolExecuted {
+                                            tool: call.function.name.clone(),
+                                            success: true,
+                                        },
+                                    )
+                                    .await;
+                            }
+                            Err(e) => {
+                                let msg = Message::new_tool_result(&call.id, &e.to_string());
+                                session.push_message(msg);
+                                self.trace
+                                    .event(
+                                        &trace_id,
+                                        TraceEvent::ToolExecuted {
+                                            tool: call.function.name.clone(),
+                                            success: false,
+                                        },
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                }
+
                 session.push_message(response.clone());
 
                 if !user_message.is_empty() {
-                    let _ = self.memory.add(user_message, vec![user_message.to_string()]).await;
+                    let _ = self
+                        .memory
+                        .add(user_message, vec![user_message.to_string()])
+                        .await;
                 }
 
                 self.trace.event(&trace_id, TraceEvent::Done).await;
+                self.persist_session(session).await;
                 Ok(response)
             }
             Err(_) => {
                 // 流式失败时回退到普通调用
                 drop(sessions);
                 self.chat(user_message, source).await
+            }
+        }
+    }
+
+    /// 尝试技能触发，返回匹配技能的执行结果
+    async fn try_skill_trigger(
+        &self,
+        user_message: &str,
+        source: &SessionSource,
+    ) -> Option<String> {
+        let matched_skill = self.skills.iter().find(|s| s.matches(user_message))?;
+
+        info!("Skill triggered: {}", matched_skill.name);
+        let executor = hermes_skill::executor::SkillExecutor::new(self.registry.clone());
+        let ctx = ToolContext::new("skill-trigger", source.clone());
+
+        match executor.execute(matched_skill, &ctx).await {
+            Ok(results) => {
+                let output: Vec<String> = results
+                    .iter()
+                    .map(|r| {
+                        if r.is_error {
+                            format!("[ERROR] {}", r.content)
+                        } else {
+                            r.content.clone()
+                        }
+                    })
+                    .collect();
+                Some(format!(
+                    "Skill '{}' executed:\n{}",
+                    matched_skill.name,
+                    output.join("\n")
+                ))
+            }
+            Err(e) => {
+                warn!("Skill '{}' execution failed: {}", matched_skill.name, e);
+                None
+            }
+        }
+    }
+
+    /// 持久化 session 到文件
+    async fn persist_session(&self, session: &Session) {
+        if let Some(dir) = &self.config.data_dir {
+            let session_dir = dir.join("sessions");
+            if let Err(e) = session.save_to_file(&session_dir).await {
+                warn!("Failed to persist session: {}", e);
             }
         }
     }
@@ -273,12 +459,7 @@ mod tests {
         let registry = Arc::new(ToolRegistry::new());
         let memory = Arc::new(MemoryStore::new());
 
-        let agent = Agent::new(
-            AgentConfig::default(),
-            llm,
-            registry,
-            memory,
-        );
+        let agent = Agent::new(AgentConfig::default(), llm, registry, memory);
 
         let response = agent.chat("Hi there", SessionSource::cli()).await.unwrap();
         assert!(response.content.contains("Hermes"));
@@ -297,7 +478,10 @@ mod tests {
             memory.clone(),
         );
 
-        agent.chat("Remember my name is Alice", SessionSource::cli()).await.unwrap();
+        agent
+            .chat("Remember my name is Alice", SessionSource::cli())
+            .await
+            .unwrap();
 
         // Memory 应该被自动写入
         let memories = memory.list().await;
@@ -311,17 +495,14 @@ mod tests {
         let registry = Arc::new(ToolRegistry::new());
         let memory = Arc::new(MemoryStore::new());
 
-        let agent = Agent::new(
-            AgentConfig::default(),
-            llm,
-            registry,
-            memory,
-        );
+        let agent = Agent::new(AgentConfig::default(), llm, registry, memory);
 
         // 直接验证 trace collector 可用
         let collector = agent.trace_collector();
         collector.start("test-trace").await;
-        collector.event("test-trace", TraceEvent::UserMessage("test".into())).await;
+        collector
+            .event("test-trace", TraceEvent::UserMessage("test".into()))
+            .await;
         collector.event("test-trace", TraceEvent::Done).await;
 
         let traces = collector.list().await;
@@ -370,12 +551,65 @@ mod tests {
         );
 
         let mut tokens = Vec::new();
-        let response = agent.chat_stream("stream me", SessionSource::cli(), |t| {
-            tokens.push(t.to_string());
-        }).await.unwrap();
+        let response = agent
+            .chat_stream("stream me", SessionSource::cli(), |t| {
+                tokens.push(t.to_string());
+            })
+            .await
+            .unwrap();
 
         let full: String = tokens.join("");
         assert_eq!(full, "Stream test");
         assert_eq!(response.content, "Stream test");
+    }
+
+    #[tokio::test]
+    async fn test_agent_skill_trigger() {
+        let llm = Arc::new(hermes_llm::FakeClient::new("Reply"));
+        let registry = Arc::new(ToolRegistry::new());
+        let memory = Arc::new(MemoryStore::new());
+
+        // 注册一个 dummy tool 以便 skill 可以执行
+        struct EchoTool;
+        #[async_trait::async_trait]
+        impl hermes_cfg::traits::ToolHandler for EchoTool {
+            fn name(&self) -> &str { "echo_action" }
+            fn description(&self) -> &str { "Echo" }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(
+                &self,
+                _args: &str,
+                _ctx: &hermes_cfg::traits::ToolContext,
+            ) -> Result<hermes_cfg::tool::ToolResult, hermes_cfg::error::ToolError> {
+                Ok(hermes_cfg::tool::ToolResult::success("echo_action", "echo ok"))
+            }
+        }
+        registry.register(Arc::new(EchoTool)).await;
+
+        let skill_yaml = r#"
+name: test_echo
+version: "1.0"
+description: Test echo skill
+trigger_patterns:
+  - "echo"
+steps:
+  - action: echo_action
+    params: {}
+"#;
+        let skill = hermes_skill::manifest::SkillManifest::from_yaml(skill_yaml).unwrap();
+
+        let agent = Agent::new(
+            AgentConfig::default(),
+            llm,
+            registry,
+            memory,
+        )
+        .with_skills(vec![skill]);
+
+        let response = agent.chat("please echo something", SessionSource::cli()).await.unwrap();
+        assert!(response.content.contains("test_echo"));
+        assert!(response.content.contains("echo ok"));
     }
 }

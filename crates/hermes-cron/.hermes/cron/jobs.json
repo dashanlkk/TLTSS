@@ -1,6 +1,6 @@
 {
-  "bef47736-728c-4b32-a789-26b1b6ccc34e": {
-    "id": "bef47736-728c-4b32-a789-26b1b6ccc34e",
+  "dccdd8a7-d739-4cbd-ae4e-e3e4be86c30c": {
+    "id": "dccdd8a7-d739-4cbd-ae4e-e3e4be86c30c",
     "name": "toggle",
     "cron_expression": "0 * * * * *",
     "payload": {
@@ -10,6 +10,6 @@
     },
     "enabled": true,
     "max_retries": 3,
-    "created_at": "2026-04-09T01:01:19.149543200Z"
+    "created_at": "2026-04-09T01:26:36.824952800Z"
   }
 }

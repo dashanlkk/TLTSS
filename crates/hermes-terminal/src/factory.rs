@@ -2,6 +2,7 @@ use hermes_cfg::traits::TerminalBackend;
 use std::sync::Arc;
 
 use crate::backend::LocalBackend;
+use crate::docker::DockerBackend;
 
 /// 根据配置创建对应的终端后端
 pub fn create_backend(
@@ -9,8 +10,17 @@ pub fn create_backend(
     working_dir: &std::path::Path,
 ) -> Arc<dyn TerminalBackend> {
     match backend_type {
-        "local" => Arc::new(LocalBackend::new(working_dir.to_path_buf())),
-        // Docker 后端留作后续实现
+        "docker" => {
+            Arc::new(DockerBackend::new("alpine:latest", working_dir.to_path_buf()))
+        }
         _ => Arc::new(LocalBackend::new(working_dir.to_path_buf())),
     }
+}
+
+/// 创建 Docker 后端并指定镜像
+pub fn create_docker_backend(
+    image: &str,
+    working_dir: &std::path::Path,
+) -> Arc<dyn TerminalBackend> {
+    Arc::new(DockerBackend::new(image, working_dir.to_path_buf()))
 }
