@@ -12,6 +12,7 @@ fn print_env_summary() {
     let sensitive_keys = [
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
         "TELEGRAM_BOT_TOKEN",
         "DISCORD_BOT_TOKEN",
     ];

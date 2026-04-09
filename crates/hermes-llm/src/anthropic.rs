@@ -20,8 +20,9 @@ use tracing::{debug, error, warn};
 struct MessagesRequest {
     model: String,
     messages: Vec<ApiMessage>,
+    /// System prompt: supports plain string or content block array for prompt caching
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<serde_json::Value>,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
@@ -169,6 +170,8 @@ pub struct AnthropicClient {
     model: String,
     max_tokens: u32,
     temperature: f32,
+    /// 启用 prompt caching（system + 最后 3 条消息标记 ephemeral cache）
+    prompt_caching: bool,
 }
 
 impl AnthropicClient {
@@ -184,6 +187,7 @@ impl AnthropicClient {
             model: model.into(),
             max_tokens: 4096,
             temperature: 0.7,
+            prompt_caching: false,
         }
     }
 
@@ -197,6 +201,12 @@ impl AnthropicClient {
         self
     }
 
+    /// 启用 prompt caching（"system_and_3" 策略）
+    pub fn with_prompt_caching(mut self) -> Self {
+        self.prompt_caching = true;
+        self
+    }
+
     /// Check if this is a third-party (non-Anthropic) endpoint
     fn is_third_party(&self) -> bool {
         let url = self.base_url.to_lowercase();
@@ -207,7 +217,10 @@ impl AnthropicClient {
     ///
     /// Returns (system_prompt, messages) where system_prompt is extracted
     /// from System-role messages per Anthropic API convention.
-    fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<ApiMessage>) {
+    ///
+    /// When `prompt_caching` is enabled, system and the last 3 messages get
+    /// `cache_control: {"type": "ephemeral"}` markers ("system_and_3" strategy).
+    fn convert_messages(messages: &[Message], prompt_caching: bool) -> (Option<serde_json::Value>, Vec<ApiMessage>) {
         let mut system_prompt = String::new();
         let mut api_messages: Vec<ApiMessage> = Vec::new();
 
@@ -289,11 +302,24 @@ impl AnthropicClient {
         // Ensure role alternation: merge consecutive same-role messages
         api_messages = merge_consecutive_roles(api_messages);
 
+        // Build system field — content block array if caching, plain string otherwise
         let system = if system_prompt.is_empty() {
             None
+        } else if prompt_caching {
+            // System as content block array with cache_control marker
+            Some(serde_json::json!([{
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"}
+            }]))
         } else {
-            Some(system_prompt)
+            Some(serde_json::Value::String(system_prompt))
         };
+
+        // Inject cache_control on the last 3 messages when caching is enabled
+        if prompt_caching {
+            inject_cache_markers(&mut api_messages, 3);
+        }
 
         (system, api_messages)
     }
@@ -355,6 +381,58 @@ impl AnthropicClient {
     }
 }
 
+/// Inject `cache_control: {"type": "ephemeral"}` on the last `n` messages.
+///
+/// For messages with String content, converts to content block array format.
+/// For messages with Object content (single text block), wraps into array.
+/// For messages with Array content, appends cache_control to the last block.
+fn inject_cache_markers(messages: &mut [ApiMessage], n: usize) {
+    let len = messages.len();
+    if len == 0 || n == 0 {
+        return;
+    }
+
+    let start = len.saturating_sub(n);
+    for msg in messages.iter_mut().skip(start) {
+        let content = match msg.content.take() {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let enriched = match content {
+            // Plain string → convert to content block array, add cache_control
+            serde_json::Value::String(s) => serde_json::json!([{
+                "type": "text",
+                "text": s,
+                "cache_control": {"type": "ephemeral"}
+            }]),
+            // Single object block (e.g. assistant {"type":"text","text":"..."}) → wrap into array
+            serde_json::Value::Object(mut map) => {
+                map.insert(
+                    "cache_control".to_string(),
+                    serde_json::json!({"type": "ephemeral"}),
+                );
+                serde_json::Value::Array(vec![serde_json::Value::Object(map)])
+            }
+            // Array of blocks → add cache_control to the last block
+            serde_json::Value::Array(mut blocks) => {
+                if let Some(last) = blocks.last_mut() {
+                    if let Some(obj) = last.as_object_mut() {
+                        obj.insert(
+                            "cache_control".to_string(),
+                            serde_json::json!({"type": "ephemeral"}),
+                        );
+                    }
+                }
+                serde_json::Value::Array(blocks)
+            }
+            other => other,
+        };
+
+        msg.content = Some(enriched);
+    }
+}
+
 /// Merge consecutive messages with the same role (Anthropic requires alternating roles)
 fn merge_consecutive_roles(messages: Vec<ApiMessage>) -> Vec<ApiMessage> {
     if messages.is_empty() {
@@ -412,7 +490,7 @@ impl LlmClient for AnthropicClient {
     ) -> Result<Message, LlmError> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
 
-        let (system, api_messages) = Self::convert_messages(messages);
+        let (system, api_messages) = Self::convert_messages(messages, self.prompt_caching);
         let api_tools = Self::convert_tools(tools);
 
         let req = MessagesRequest {
@@ -425,7 +503,7 @@ impl LlmClient for AnthropicClient {
             stream: None,
         };
 
-        debug!("Sending Anthropic request to {}", url);
+        debug!("Sending Anthropic request to {} (caching={})", url, self.prompt_caching);
 
         let resp = self
             .client
@@ -472,7 +550,7 @@ impl LlmClient for AnthropicClient {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, LlmError>> + Send>>, LlmError> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
 
-        let (system, api_messages) = Self::convert_messages(messages);
+        let (system, api_messages) = Self::convert_messages(messages, self.prompt_caching);
         let api_tools = Self::convert_tools(tools);
 
         let req = MessagesRequest {
@@ -549,38 +627,45 @@ impl LlmClient for AnthropicClient {
                     // Dispatch based on event type
                     match event_type.as_str() {
                         "content_block_delta" => {
-                            if let Ok(delta) = serde_json::from_str::<ContentBlockDelta>(&data_str) {
-                                match delta {
-                                    ContentBlockDelta::TextDelta { text } => {
-                                        if !text.is_empty() {
-                                            yield Ok(StreamEvent::Delta(text));
-                                        }
-                                    }
-                                    ContentBlockDelta::InputJsonDelta { partial_json } => {
-                                        // Accumulate tool input — we yield the complete tool call later
-                                        // For now, just buffer
-                                        debug!("Tool input delta: {}", partial_json);
-                                    }
-                                    ContentBlockDelta::ThinkingDelta { thinking } => {
-                                        if !thinking.is_empty() {
-                                            yield Ok(StreamEvent::Reasoning(thinking));
+                            // SSE data is: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"..."}}
+                            // We need to extract the inner "delta" field before deserializing
+                            if let Ok(data_val) = serde_json::from_str::<serde_json::Value>(&data_str) {
+                                if let Some(delta_val) = data_val.get("delta") {
+                                    if let Ok(delta) = serde_json::from_value::<ContentBlockDelta>(delta_val.clone()) {
+                                        match delta {
+                                            ContentBlockDelta::TextDelta { text } => {
+                                                if !text.is_empty() {
+                                                    yield Ok(StreamEvent::Delta(text));
+                                                }
+                                            }
+                                            ContentBlockDelta::InputJsonDelta { partial_json } => {
+                                                debug!("Tool input delta: {}", partial_json);
+                                            }
+                                            ContentBlockDelta::ThinkingDelta { thinking } => {
+                                                if !thinking.is_empty() {
+                                                    yield Ok(StreamEvent::Reasoning(thinking));
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
                         "content_block_start" => {
-                            // Track tool_use block starts
+                            // SSE data is: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use",...}}
+                            // Tool info is inside "content_block" sub-object
                             if let Ok(start) =
                                 serde_json::from_str::<serde_json::Value>(&data_str)
                             {
-                                if start.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                                    let id = start
+                                let block = start.get("content_block");
+                                if block.and_then(|b| b.get("type")).and_then(|t| t.as_str()) == Some("tool_use") {
+                                    let cb = block.unwrap();
+                                    let id = cb
                                         .get("id")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("")
                                         .to_string();
-                                    let name = start
+                                    let name = cb
                                         .get("name")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("")
@@ -670,8 +755,9 @@ mod tests {
             Message::new_system("You are helpful"),
             Message::new_user("Hello"),
         ];
-        let (system, api_msgs) = AnthropicClient::convert_messages(&messages);
-        assert_eq!(system, Some("You are helpful".to_string()));
+        let (system, api_msgs) = AnthropicClient::convert_messages(&messages, false);
+        // Without caching, system is a plain string
+        assert_eq!(system.as_ref().and_then(|v| v.as_str()), Some("You are helpful"));
         assert_eq!(api_msgs.len(), 1);
         assert_eq!(api_msgs[0].role, "user");
     }
@@ -690,7 +776,7 @@ mod tests {
             }]),
             Message::new_tool_result("tool_1", "file1.txt\nfile2.txt"),
         ];
-        let (_, api_msgs) = AnthropicClient::convert_messages(&messages);
+        let (_, api_msgs) = AnthropicClient::convert_messages(&messages, false);
         // assistant + tool_result (as user role)
         assert_eq!(api_msgs.len(), 3);
         assert_eq!(api_msgs[0].role, "user");
@@ -771,5 +857,111 @@ mod tests {
         let content = merged[0].content.as_ref().unwrap();
         assert!(content.as_str().unwrap().contains("Hello"));
         assert!(content.as_str().unwrap().contains("World"));
+    }
+
+    // ── Prompt Caching 测试 ──
+
+    #[test]
+    fn test_caching_system_is_block_array() {
+        let messages = vec![
+            Message::new_system("You are helpful"),
+            Message::new_user("Hello"),
+        ];
+        let (system, _) = AnthropicClient::convert_messages(&messages, true);
+        // With caching, system should be an array of content blocks
+        let system = system.unwrap();
+        assert!(system.is_array());
+        let blocks = system.as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_caching_system_without_cache() {
+        let messages = vec![
+            Message::new_system("You are helpful"),
+            Message::new_user("Hello"),
+        ];
+        let (system, _) = AnthropicClient::convert_messages(&messages, false);
+        // Without caching, system is a plain string
+        let system = system.unwrap();
+        assert!(system.is_string());
+        assert_eq!(system.as_str().unwrap(), "You are helpful");
+    }
+
+    #[test]
+    fn test_caching_marks_last_n_messages() {
+        let messages = vec![
+            Message::new_system("System"),
+            Message::new_user("msg1"),
+            Message::new_assistant("reply1"),
+            Message::new_user("msg2"),
+            Message::new_assistant("reply2"),
+            Message::new_user("msg3"),
+        ];
+        let (_, api_msgs) = AnthropicClient::convert_messages(&messages, true);
+        // 5 non-system messages → last 3 should have cache_control
+        assert_eq!(api_msgs.len(), 5);
+
+        // First 2 should NOT have cache_control
+        for msg in &api_msgs[0..2] {
+            let content = msg.content.as_ref().unwrap();
+            let has_cache = match content {
+                serde_json::Value::Array(blocks) => blocks.iter().any(|b| b.get("cache_control").is_some()),
+                serde_json::Value::Object(map) => map.contains_key("cache_control"),
+                _ => false,
+            };
+            assert!(!has_cache, "First 2 messages should not have cache_control");
+        }
+
+        // Last 3 should have cache_control (converted to content block arrays)
+        for msg in &api_msgs[2..] {
+            let content = msg.content.as_ref().unwrap();
+            assert!(content.is_array(), "Expected array content for cached message");
+            let blocks = content.as_array().unwrap();
+            let last_block = blocks.last().unwrap();
+            assert_eq!(last_block["cache_control"]["type"], "ephemeral");
+        }
+    }
+
+    #[test]
+    fn test_inject_cache_markers_on_tool_result() {
+        let messages = vec![
+            Message::new_system("System"),
+            Message::new_user("Do something"),
+            Message::new_assistant("").with_tool_calls(vec![ToolCall {
+                id: "t1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            Message::new_tool_result("t1", "file contents"),
+        ];
+        let (_, api_msgs) = AnthropicClient::convert_messages(&messages, true);
+        // 3 non-system messages, all should be cached (3 <= 3)
+        // Last message (tool_result) has array content → last block should have cache_control
+        let last = api_msgs.last().unwrap();
+        let content = last.content.as_ref().unwrap();
+        assert!(content.is_array());
+        let blocks = content.as_array().unwrap();
+        let last_block = blocks.last().unwrap();
+        assert_eq!(last_block["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_inject_cache_markers_empty_messages() {
+        let mut messages: Vec<ApiMessage> = vec![];
+        inject_cache_markers(&mut messages, 3);
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_with_prompt_caching_builder() {
+        let client = AnthropicClient::new("http://localhost", "key", "model")
+            .with_prompt_caching();
+        assert!(client.prompt_caching);
     }
 }

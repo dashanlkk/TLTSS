@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use hermes_agent::Agent;
 use hermes_core::config::AppConfig;
+use hermes_core::provider::{ProviderRegistry, ProviderType};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -10,6 +11,10 @@ struct Cli {
     /// Config file path
     #[arg(long, global = true)]
     config: Option<String>,
+
+    /// Provider name to use (overrides auto-detection)
+    #[arg(long, global = true)]
+    provider: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -160,84 +165,60 @@ fn load_config(cli_path: Option<&str>) -> AppConfig {
 
 // ── 组件初始化 ────────────────────────────────────────────────────
 
-/// 创建 LLM 客户端：自动检测 provider（Anthropic/OpenAI/Fake）
-fn create_llm_client(config: &AppConfig) -> Arc<dyn hermes_cfg::traits::LlmClient> {
-    let anthropic_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
-    let anthropic_base = std::env::var("ANTHROPIC_BASE_URL")
-        .ok()
-        .or_else(|| config.model.anthropic_base_url.clone());
+/// 创建 LLM 客户端：使用 ProviderRegistry 自动检测或 CLI --provider 指定
+fn create_llm_client(config: &AppConfig, provider_name: Option<&str>) -> Arc<dyn hermes_cfg::traits::LlmClient> {
+    let registry = ProviderRegistry::from_app_config(config);
 
-    let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-    let openai_base = std::env::var("OPENAI_BASE_URL")
-        .ok()
-        .or_else(|| config.model.base_url.clone());
+    // Resolve which provider to use
+    let resolved = if let Some(name) = provider_name {
+        match registry.get(name) {
+            Some(cfg) => Some((name.to_string(), cfg.clone())),
+            None => {
+                tracing::warn!("Provider '{}' not found in registry, falling back to auto-detect", name);
+                registry.default_provider().map(|(n, c)| (n.clone(), c.clone()))
+            }
+        }
+    } else {
+        registry.default_provider().map(|(n, c)| (n.clone(), c.clone()))
+    };
 
-    let model = std::env::var("HERMES_MODEL")
-        .unwrap_or_else(|_| config.model.default.clone());
-
-    // Provider detection priority:
-    // 1. Explicit config.provider setting
-    // 2. ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL → Anthropic
-    // 3. OPENAI_API_KEY → OpenAI
-    // 4. FakeClient fallback
-    let provider = config.model.provider.as_deref().unwrap_or("auto");
-
-    match provider {
-        "anthropic" => {
-            let key = if anthropic_key.is_empty() { openai_key.clone() } else { anthropic_key };
-            let base = anthropic_base.unwrap_or_else(|| "https://api.anthropic.com".to_string());
-            if key.is_empty() {
-                tracing::warn!("Anthropic provider selected but no API key found, using FakeClient");
+    match resolved {
+        Some((name, cfg)) => {
+            let api_key = cfg.api_key.as_deref().unwrap_or("");
+            if api_key.is_empty() {
+                tracing::warn!("Provider '{}' has no API key, using FakeClient", name);
                 return Arc::new(hermes_llm::FakeClient::new(
-                    "Hello! I'm Hermes (fake mode). Set ANTHROPIC_API_KEY for real LLM.",
+                    "Hello! I'm Hermes (fake mode). Set API key for real LLM.",
                 ));
             }
-            tracing::info!("Using Anthropic client (model: {}, base: {})", model, base);
-            Arc::new(
-                hermes_llm::AnthropicClient::new(&base, &key, &model)
-                    .with_max_tokens(config.model.max_tokens)
-                    .with_temperature(config.model.temperature),
-            )
-        }
-        "openai" => {
-            if openai_key.is_empty() {
-                tracing::warn!("OpenAI provider selected but no API key found, using FakeClient");
-                return Arc::new(hermes_llm::FakeClient::new(
-                    "Hello! I'm Hermes (fake mode). Set OPENAI_API_KEY for real LLM.",
-                ));
+
+            match cfg.provider_type {
+                ProviderType::Anthropic => {
+                    let base = cfg.base_url.unwrap_or_else(|| "https://api.anthropic.com".to_string());
+                    tracing::info!("Using Anthropic provider '{}' (model: {}, base: {})", name, cfg.model, base);
+                    Arc::new(
+                        hermes_llm::AnthropicClient::new(&base, api_key, &cfg.model)
+                            .with_max_tokens(cfg.max_tokens)
+                            .with_temperature(cfg.temperature)
+                            .with_prompt_caching(),
+                    )
+                }
+                ProviderType::Openai => {
+                    let base = cfg.base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+                    tracing::info!("Using OpenAI provider '{}' (model: {}, base: {})", name, cfg.model, base);
+                    Arc::new(
+                        hermes_llm::OpenAIClient::new(&base, api_key, &cfg.model)
+                            .with_max_tokens(cfg.max_tokens)
+                            .with_temperature(cfg.temperature),
+                    )
+                }
             }
-            let base = openai_base.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-            tracing::info!("Using OpenAI client (model: {}, base: {})", model, base);
-            Arc::new(
-                hermes_llm::OpenAIClient::new(&base, &openai_key, &model)
-                    .with_max_tokens(config.model.max_tokens)
-                    .with_temperature(config.model.temperature),
-            )
         }
-        _ => {
-            // Auto-detect
-            if !anthropic_key.is_empty() {
-                let base = anthropic_base.unwrap_or_else(|| "https://api.anthropic.com".to_string());
-                tracing::info!("Auto-detected Anthropic provider (model: {}, base: {})", model, base);
-                Arc::new(
-                    hermes_llm::AnthropicClient::new(&base, &anthropic_key, &model)
-                        .with_max_tokens(config.model.max_tokens)
-                        .with_temperature(config.model.temperature),
-                )
-            } else if !openai_key.is_empty() {
-                let base = openai_base.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-                tracing::info!("Auto-detected OpenAI provider (model: {}, base: {})", model, base);
-                Arc::new(
-                    hermes_llm::OpenAIClient::new(&base, &openai_key, &model)
-                        .with_max_tokens(config.model.max_tokens)
-                        .with_temperature(config.model.temperature),
-                )
-            } else {
-                tracing::info!("No API key set, using FakeClient");
-                Arc::new(hermes_llm::FakeClient::new(
-                    "Hello! I'm Hermes (fake mode). Set ANTHROPIC_API_KEY or OPENAI_API_KEY for real LLM.",
-                ))
-            }
+        None => {
+            tracing::info!("No provider configured, using FakeClient");
+            Arc::new(hermes_llm::FakeClient::new(
+                "Hello! I'm Hermes (fake mode). Set ANTHROPIC_API_KEY or OPENAI_API_KEY for real LLM.",
+            ))
         }
     }
 }
@@ -262,6 +243,18 @@ async fn create_tool_registry(
         .await;
     registry
         .register(Arc::new(hermes_tools::builtin::ListDirTool::new(&base_dir)))
+        .await;
+    registry
+        .register(Arc::new(hermes_tools::builtin::SearchFilesTool::new(&base_dir)))
+        .await;
+    registry
+        .register(Arc::new(hermes_tools::builtin::WebFetchTool::new()))
+        .await;
+    registry
+        .register(Arc::new(hermes_tools::builtin::TodoTool::new(&base_dir)))
+        .await;
+    registry
+        .register(Arc::new(hermes_tools::builtin::ClarifyTool::new()))
         .await;
 
     // 注册 MCP 工具
@@ -311,10 +304,11 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let config = load_config(cli.config.as_deref());
+    let provider_override = cli.provider.as_deref();
 
     match cli.command {
         Commands::Chat { tui, stream } => {
-            run_chat(&config, tui, stream).await?;
+            run_chat(&config, tui, stream, provider_override).await?;
         }
         Commands::Config { action } => match action {
             ConfigCommands::Show => show_config(&config)?,
@@ -349,12 +343,12 @@ async fn main() -> anyhow::Result<()> {
 
 // ── Chat 命令 ─────────────────────────────────────────────────────
 
-async fn run_chat(config: &AppConfig, tui: bool, stream: bool) -> anyhow::Result<()> {
+async fn run_chat(config: &AppConfig, tui: bool, stream: bool, provider: Option<&str>) -> anyhow::Result<()> {
     use hermes_agent::{Agent, MemoryStore};
     use hermes_agent::agent::AgentConfig;
 
     let terminal = create_terminal(config);
-    let llm = create_llm_client(config);
+    let llm = create_llm_client(config, provider);
     let registry = create_tool_registry(config, terminal).await;
     let memory = Arc::new(MemoryStore::new());
 

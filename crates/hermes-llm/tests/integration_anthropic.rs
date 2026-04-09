@@ -3,14 +3,17 @@
 //! Run with: ANTHROPIC_API_KEY=... cargo test --package hermes-llm --test integration_anthropic -- --nocapture --ignored
 
 use hermes_cfg::prelude::*;
-use hermes_cfg::traits::LlmClient;
+use hermes_cfg::traits::{LlmClient, StreamEvent};
 use hermes_llm::AnthropicClient;
 
 fn get_client() -> Option<AnthropicClient> {
-    let key = std::env::var("ANTHROPIC_API_KEY").ok()?;
+    let key = std::env::var("ANTHROPIC_API_KEY")
+        .or_else(|_| std::env::var("ANTHROPIC_AUTH_TOKEN"))
+        .ok()?;
     let base = std::env::var("ANTHROPIC_BASE_URL")
         .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
     let model = std::env::var("HERMES_MODEL")
+        .or_else(|_| std::env::var("ANTHROPIC_MODEL"))
         .unwrap_or_else(|_| "claude-sonnet-4-5".to_string());
     Some(
         AnthropicClient::new(&base, &key, &model)
@@ -82,6 +85,60 @@ async fn test_anthropic_tool_calling() {
                 eprintln!("Skipping: {}", err_str);
             } else {
                 panic!("API error: {}", err_str);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_anthropic_streaming() {
+    let client = get_client().expect("Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN");
+
+    let messages = vec![Message::new_user("Say exactly: Hello World")];
+    let result = client.complete_stream(&messages, &[]).await;
+
+    match result {
+        Ok(mut stream) => {
+            use futures::StreamExt;
+            let mut tokens = Vec::new();
+            let mut done = false;
+
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(StreamEvent::Delta(token)) => {
+                        tokens.push(token);
+                    }
+                    Ok(StreamEvent::Reasoning(r)) => {
+                        println!("Reasoning: {}", r);
+                    }
+                    Ok(StreamEvent::ToolCall { id, name, arguments }) => {
+                        println!("ToolCall: {}({})", name, arguments);
+                    }
+                    Ok(StreamEvent::Done) => {
+                        done = true;
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("Stream error: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            let full = tokens.join("");
+            println!("Streamed tokens: {}", tokens.len());
+            println!("Full content: {}", full);
+            println!("Done: {}", done);
+            assert!(!tokens.is_empty(), "Expected some streamed tokens, got 0");
+            assert!(done, "Expected Done event");
+        }
+        Err(e) => {
+            let err_str = format!("{}", e);
+            if err_str.contains("429") || err_str.contains("balance") {
+                eprintln!("Skipping: {}", err_str);
+            } else {
+                panic!("Stream error: {}", err_str);
             }
         }
     }

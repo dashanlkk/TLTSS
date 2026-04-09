@@ -938,6 +938,7 @@ dependencies = [
  "hermes-cfg",
  "hermes-security",
  "hermes-terminal",
+ "reqwest",
  "schemars",
  "serde",
  "serde_json",

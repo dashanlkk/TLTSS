@@ -3,6 +3,7 @@
 pub mod registry;
 pub mod builtin;
 pub mod approval;
+pub mod coerce;
 
 pub use registry::ToolRegistry;
 pub use approval::ApprovalManager;

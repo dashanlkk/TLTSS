@@ -267,11 +267,14 @@ impl LlmClient for OpenAIClient {
             return Err(LlmError::ProviderError(format!("Stream init failed: {}", status)));
         }
 
-        // SSE 流解析
+        // SSE 流解析 — 支持 delta.content + delta.tool_calls 增量拼接
         let stream = async_stream::stream! {
             let mut buffer = String::new();
             let mut stream = resp.bytes_stream();
             use futures::StreamExt;
+
+            // Tool call 增量拼接状态：(id, name, arguments)
+            let mut pending_tool_calls: Vec<(String, String, String)> = Vec::new();
 
             while let Some(chunk) = stream.next().await {
                 let chunk = match chunk {
@@ -289,13 +292,56 @@ impl LlmClient for OpenAIClient {
 
                     if let Some(data) = line.strip_prefix("data: ") {
                         if data == "[DONE]" {
+                            // Emit completed tool calls before Done
+                            for (id, name, arguments) in pending_tool_calls.drain(..) {
+                                yield Ok(StreamEvent::ToolCall {
+                                    id,
+                                    name,
+                                    arguments,
+                                });
+                            }
                             yield Ok(StreamEvent::Done);
                             break;
                         }
                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
-                            if let Some(content) = parsed["choices"][0]["delta"]["content"].as_str() {
+                            let delta = &parsed["choices"][0]["delta"];
+
+                            // Text content
+                            if let Some(content) = delta["content"].as_str() {
                                 if !content.is_empty() {
                                     yield Ok(StreamEvent::Delta(content.to_string()));
+                                }
+                            }
+
+                            // Reasoning content (e.g. GLM reasoning_content field)
+                            if let Some(reasoning) = delta["reasoning_content"].as_str() {
+                                if !reasoning.is_empty() {
+                                    yield Ok(StreamEvent::Reasoning(reasoning.to_string()));
+                                }
+                            }
+
+                            // Tool calls — incremental assembly
+                            if let Some(tc_array) = delta["tool_calls"].as_array() {
+                                for tc in tc_array {
+                                    let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+
+                                    // Extend pending list if needed
+                                    if idx >= pending_tool_calls.len() {
+                                        pending_tool_calls.resize(idx + 1, (String::new(), String::new(), String::new()));
+                                    }
+
+                                    // Update id (only present in first chunk)
+                                    if let Some(id) = tc["id"].as_str() {
+                                        pending_tool_calls[idx].0 = id.to_string();
+                                    }
+                                    // Update name (only present in first chunk)
+                                    if let Some(name) = tc["function"]["name"].as_str() {
+                                        pending_tool_calls[idx].1 = name.to_string();
+                                    }
+                                    // Append arguments incrementally
+                                    if let Some(args) = tc["function"]["arguments"].as_str() {
+                                        pending_tool_calls[idx].2.push_str(args);
+                                    }
                                 }
                             }
                         }
@@ -317,5 +363,55 @@ impl LlmClient for OpenAIClient {
             .await
             .map_err(|e| LlmError::ConnectionFailed(e.to_string()))?;
         Ok(start.elapsed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    #[test]
+    fn test_messages_to_api_roles() {
+        let messages = vec![
+            Message::new_system("sys"),
+            Message::new_user("hello"),
+            Message::new_assistant("hi"),
+            Message::new_tool_result("c1", "result"),
+        ];
+        let api = OpenAIClient::messages_to_api(&messages);
+        assert_eq!(api[0].role, "system");
+        assert_eq!(api[1].role, "user");
+        assert_eq!(api[2].role, "assistant");
+        assert_eq!(api[3].role, "tool");
+    }
+
+    #[test]
+    fn test_messages_to_api_tool_calls() {
+        let mut msg = Message::new_assistant("let me check");
+        msg = msg.with_tool_calls(vec![ToolCall {
+            id: "call_1".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "read_file".into(),
+                arguments: r#"{"path":"test.rs"}"#.into(),
+            },
+        }]);
+        let api = OpenAIClient::messages_to_api(&[msg]);
+        assert!(api[0].tool_calls.is_some());
+        let tc = api[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tc[0].function.name, "read_file");
+    }
+
+    #[test]
+    fn test_tools_to_api() {
+        let tools = vec![ToolDefinition {
+            name: "bash".into(),
+            description: "Run command".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let api = OpenAIClient::tools_to_api(&tools);
+        assert_eq!(api[0].tool_type, "function");
+        assert_eq!(api[0].function.name, "bash");
     }
 }

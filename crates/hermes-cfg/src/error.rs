@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 /// LLM 调用错误
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum LlmError {
     #[error("Authentication failed: {0}")]
     AuthenticationFailed(String),
