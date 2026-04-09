@@ -145,7 +145,20 @@ impl Agent {
 
         loop {
             if rounds >= self.config.max_tool_rounds {
-                warn!("Max tool rounds reached");
+                warn!("Max tool rounds reached, requesting final text response");
+                // Make one final call without tools to get a text summary
+                let final_response = {
+                    let llm = &self.llm;
+                    let msgs = &current_messages;
+                    retry::retry_llm_call(self.config.max_retries, || {
+                        let msgs = msgs.clone();
+                        async move { llm.complete(&msgs, &[]).await }
+                    }).await
+                };
+                if let Ok(resp) = final_response {
+                    current_messages.push(resp.clone());
+                    session.push_message(resp);
+                }
                 break;
             }
             if iterations >= self.config.max_iterations {
@@ -208,6 +221,7 @@ impl Agent {
 
             // 检查是否有工具调用
             let tool_calls = response.tool_calls.clone();
+            current_messages.push(response.clone());
             session.push_message(response.clone());
 
             if let Some(calls) = tool_calls {
