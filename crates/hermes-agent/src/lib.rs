@@ -5,8 +5,12 @@ pub mod prompt;
 pub mod agent;
 pub mod memory;
 pub mod trace;
+pub mod retry;
+pub mod compressor;
 
 pub use agent::Agent;
 pub use session::Session;
 pub use memory::MemoryStore;
 pub use trace::TraceCollector;
+pub use retry::{RecoveryStrategy, classify_error, jittered_backoff, retry_llm_call};
+pub use compressor::{CompressionConfig, compress, should_compress, estimate_tokens};

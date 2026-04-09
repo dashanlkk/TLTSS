@@ -31,6 +31,12 @@ pub struct ModelConfig {
     pub fallback_model: Option<String>,
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Inference provider: "auto", "openai", "anthropic"
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Anthropic-specific base URL (for third-party Anthropic-compatible endpoints)
+    #[serde(default)]
+    pub anthropic_base_url: Option<String>,
 }
 
 fn default_model() -> String {
@@ -49,6 +55,8 @@ impl Default for ModelConfig {
             temperature: default_temperature(),
             fallback_model: None,
             base_url: None,
+            provider: None,
+            anthropic_base_url: None,
         }
     }
 }

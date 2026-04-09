@@ -13,12 +13,18 @@ use crate::memory::MemoryStore;
 use crate::prompt::PromptBuilder;
 use crate::session::Session;
 use crate::trace::{TraceCollector, TraceEvent};
+use crate::compressor::{self, CompressionConfig};
+use crate::retry::{self, RecoveryStrategy};
 
 /// Agent 配置
 pub struct AgentConfig {
     pub system_prompt: String,
     pub max_tool_rounds: u32,
+    /// Maximum total API call iterations per conversation (default: 90)
+    pub max_iterations: u32,
     pub max_context_tokens: usize,
+    /// Maximum LLM retries per call (default: 3)
+    pub max_retries: u32,
     pub data_dir: Option<PathBuf>,
 }
 
@@ -27,7 +33,9 @@ impl Default for AgentConfig {
         Self {
             system_prompt: "You are Hermes, an intelligent AI assistant. You can use tools to help users.".to_string(),
             max_tool_rounds: 10,
-            max_context_tokens: 8000,
+            max_iterations: 90,
+            max_context_tokens: 128_000,
+            max_retries: 3,
             data_dir: None,
         }
     }
@@ -129,20 +137,68 @@ impl Agent {
             .event(&trace_id, TraceEvent::PromptBuilt(messages.len()))
             .await;
 
-        // Agent loop
+        // Agent loop with retry and compression
         let mut current_messages = messages;
         let mut rounds = 0;
+        let mut iterations = 0;
+        let mut compression_config = CompressionConfig::default();
 
         loop {
             if rounds >= self.config.max_tool_rounds {
                 warn!("Max tool rounds reached");
                 break;
             }
+            if iterations >= self.config.max_iterations {
+                warn!("Max iterations ({}) reached", self.config.max_iterations);
+                break;
+            }
 
-            // 调用 LLM
+            // Pre-call compression check
+            if compressor::should_compress(&current_messages, self.config.max_context_tokens, &compression_config) {
+                info!("Context compression triggered");
+                let result = compressor::compress(&current_messages, self.config.max_context_tokens, &compression_config);
+                current_messages = result.messages;
+            }
+
+            // 调用 LLM with retry
             self.trace.event(&trace_id, TraceEvent::LlmCallStart).await;
             let tools = self.registry.tool_definitions().await;
-            let response = self.llm.complete(&current_messages, &tools).await?;
+            iterations += 1;
+
+            let response = {
+                let llm = &self.llm;
+                let msgs = &current_messages;
+                let tool_defs = &tools;
+                let max_retries = self.config.max_retries;
+
+                retry::retry_llm_call(max_retries, || {
+                    let msgs = msgs.clone();
+                    let tool_defs = tool_defs.clone();
+                    async move { llm.complete(&msgs, &tool_defs).await }
+                }).await
+            };
+
+            let response = match response {
+                Ok(r) => r,
+                Err(e) => {
+                    let strategy = retry::classify_error(&e);
+                    match strategy {
+                        RecoveryStrategy::Compress => {
+                            // Force compress and retry once more
+                            info!("Context overflow, forcing compression");
+                            let compressed = compressor::compress(
+                                &current_messages,
+                                self.config.max_context_tokens / 2,
+                                &compression_config,
+                            );
+                            current_messages = compressed.messages;
+                            continue;
+                        }
+                        _ => return Err(e.into()),
+                    }
+                }
+            };
+
             self.trace
                 .event(
                     &trace_id,
@@ -292,6 +348,7 @@ impl Agent {
         match self.llm.complete_stream(&messages, &tools).await {
             Ok(mut stream) => {
                 let mut full_content = String::new();
+                let mut full_reasoning = String::new();
                 let mut pending_tool_calls: Vec<hermes_cfg::tool::ToolCall> = Vec::new();
 
                 while let Some(event) = stream.next().await {
@@ -299,6 +356,9 @@ impl Agent {
                         Ok(StreamEvent::Delta(token)) => {
                             on_token(&token);
                             full_content.push_str(&token);
+                        }
+                        Ok(StreamEvent::Reasoning(token)) => {
+                            full_reasoning.push_str(&token);
                         }
                         Ok(StreamEvent::Done) => break,
                         Ok(StreamEvent::ToolCall {

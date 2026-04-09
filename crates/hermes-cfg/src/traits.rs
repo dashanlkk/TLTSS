@@ -38,6 +38,8 @@ use std::time::Duration;
 pub enum StreamEvent {
     /// 增量文本 token
     Delta(String),
+    /// 推理内容 token（Anthropic thinking / OpenAI reasoning）
+    Reasoning(String),
     /// 工具调用
     ToolCall {
         id: String,

@@ -22,6 +22,9 @@ pub struct Message {
     pub tool_calls: Option<Vec<super::tool::ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// 推理内容（Anthropic thinking block / OpenAI reasoning）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -33,6 +36,7 @@ impl Message {
             content: content.into(),
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
             timestamp: Utc::now(),
         }
     }
@@ -44,6 +48,7 @@ impl Message {
             content: content.into(),
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
             timestamp: Utc::now(),
         }
     }
@@ -55,6 +60,7 @@ impl Message {
             content: content.into(),
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
             timestamp: Utc::now(),
         }
     }
@@ -66,12 +72,18 @@ impl Message {
             content: content.into(),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
+            reasoning: None,
             timestamp: Utc::now(),
         }
     }
 
     pub fn with_tool_calls(mut self, calls: Vec<super::tool::ToolCall>) -> Self {
         self.tool_calls = Some(calls);
+        self
+    }
+
+    pub fn with_reasoning(mut self, reasoning: impl Into<String>) -> Self {
+        self.reasoning = Some(reasoning.into());
         self
     }
 }

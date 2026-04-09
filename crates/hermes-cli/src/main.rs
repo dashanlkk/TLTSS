@@ -160,28 +160,85 @@ fn load_config(cli_path: Option<&str>) -> AppConfig {
 
 // ── 组件初始化 ────────────────────────────────────────────────────
 
-/// 创建 LLM 客户端：有 API key 则 OpenAI，否则 FakeClient
+/// 创建 LLM 客户端：自动检测 provider（Anthropic/OpenAI/Fake）
 fn create_llm_client(config: &AppConfig) -> Arc<dyn hermes_cfg::traits::LlmClient> {
-    let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+    let anthropic_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+    let anthropic_base = std::env::var("ANTHROPIC_BASE_URL")
+        .ok()
+        .or_else(|| config.model.anthropic_base_url.clone());
+
+    let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+    let openai_base = std::env::var("OPENAI_BASE_URL")
+        .ok()
+        .or_else(|| config.model.base_url.clone());
+
     let model = std::env::var("HERMES_MODEL")
         .unwrap_or_else(|_| config.model.default.clone());
-    let base_url = std::env::var("OPENAI_BASE_URL")
-        .ok()
-        .or_else(|| config.model.base_url.clone())
-        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
 
-    if api_key.is_empty() {
-        tracing::info!("No OPENAI_API_KEY set, using FakeClient");
-        Arc::new(hermes_llm::FakeClient::new(
-            "Hello! I'm Hermes (fake mode). Set OPENAI_API_KEY for real LLM.",
-        ))
-    } else {
-        tracing::info!("Using OpenAI client (model: {})", model);
-        Arc::new(
-            hermes_llm::OpenAIClient::new(&base_url, &api_key, &model)
-                .with_max_tokens(config.model.max_tokens)
-                .with_temperature(config.model.temperature),
-        )
+    // Provider detection priority:
+    // 1. Explicit config.provider setting
+    // 2. ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL → Anthropic
+    // 3. OPENAI_API_KEY → OpenAI
+    // 4. FakeClient fallback
+    let provider = config.model.provider.as_deref().unwrap_or("auto");
+
+    match provider {
+        "anthropic" => {
+            let key = if anthropic_key.is_empty() { openai_key.clone() } else { anthropic_key };
+            let base = anthropic_base.unwrap_or_else(|| "https://api.anthropic.com".to_string());
+            if key.is_empty() {
+                tracing::warn!("Anthropic provider selected but no API key found, using FakeClient");
+                return Arc::new(hermes_llm::FakeClient::new(
+                    "Hello! I'm Hermes (fake mode). Set ANTHROPIC_API_KEY for real LLM.",
+                ));
+            }
+            tracing::info!("Using Anthropic client (model: {}, base: {})", model, base);
+            Arc::new(
+                hermes_llm::AnthropicClient::new(&base, &key, &model)
+                    .with_max_tokens(config.model.max_tokens)
+                    .with_temperature(config.model.temperature),
+            )
+        }
+        "openai" => {
+            if openai_key.is_empty() {
+                tracing::warn!("OpenAI provider selected but no API key found, using FakeClient");
+                return Arc::new(hermes_llm::FakeClient::new(
+                    "Hello! I'm Hermes (fake mode). Set OPENAI_API_KEY for real LLM.",
+                ));
+            }
+            let base = openai_base.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+            tracing::info!("Using OpenAI client (model: {}, base: {})", model, base);
+            Arc::new(
+                hermes_llm::OpenAIClient::new(&base, &openai_key, &model)
+                    .with_max_tokens(config.model.max_tokens)
+                    .with_temperature(config.model.temperature),
+            )
+        }
+        _ => {
+            // Auto-detect
+            if !anthropic_key.is_empty() {
+                let base = anthropic_base.unwrap_or_else(|| "https://api.anthropic.com".to_string());
+                tracing::info!("Auto-detected Anthropic provider (model: {}, base: {})", model, base);
+                Arc::new(
+                    hermes_llm::AnthropicClient::new(&base, &anthropic_key, &model)
+                        .with_max_tokens(config.model.max_tokens)
+                        .with_temperature(config.model.temperature),
+                )
+            } else if !openai_key.is_empty() {
+                let base = openai_base.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+                tracing::info!("Auto-detected OpenAI provider (model: {}, base: {})", model, base);
+                Arc::new(
+                    hermes_llm::OpenAIClient::new(&base, &openai_key, &model)
+                        .with_max_tokens(config.model.max_tokens)
+                        .with_temperature(config.model.temperature),
+                )
+            } else {
+                tracing::info!("No API key set, using FakeClient");
+                Arc::new(hermes_llm::FakeClient::new(
+                    "Hello! I'm Hermes (fake mode). Set ANTHROPIC_API_KEY or OPENAI_API_KEY for real LLM.",
+                ))
+            }
+        }
     }
 }
 
