@@ -36,6 +36,8 @@ pub enum ToolError {
     InvalidArguments(String),
     #[error("Sensitive file access denied: {0}")]
     SensitiveFileAccess(String),
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
 }
 
 /// 终端执行错误

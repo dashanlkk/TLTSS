@@ -1,19 +1,36 @@
 use hermes_cfg::prelude::*;
-use hermes_cfg::traits::{ToolContext, ToolHandler};
+use hermes_cfg::traits::{ApprovalLevel, ToolContext, ToolHandler};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::approval::ApprovalManager;
+
 /// 线程安全的工具注册表
 pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn ToolHandler>>>,
+    approval: Arc<ApprovalManager>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: RwLock::new(HashMap::new()),
+            approval: Arc::new(ApprovalManager::new()),
         }
+    }
+
+    /// 使用自定义审批管理器
+    pub fn with_approval(approval: Arc<ApprovalManager>) -> Self {
+        Self {
+            tools: RwLock::new(HashMap::new()),
+            approval,
+        }
+    }
+
+    /// 获取审批管理器引用
+    pub fn approval_manager(&self) -> &Arc<ApprovalManager> {
+        &self.approval
     }
 
     /// 注册工具
@@ -39,7 +56,7 @@ impl ToolRegistry {
         tools.values().map(|t| t.to_tool_definition()).collect()
     }
 
-    /// 执行指定工具
+    /// 执行指定工具（含审批检查）
     pub async fn execute(
         &self,
         name: &str,
@@ -50,6 +67,86 @@ impl ToolRegistry {
             .get(name)
             .await
             .ok_or_else(|| ToolError::NotFound(name.to_string()))?;
+
+        // 检查工具级别审批策略
+        let level = self.approval.get_level(name).await;
+        match level {
+            ApprovalLevel::Blocked => {
+                return Err(ToolError::PermissionDenied(format!(
+                    "Tool '{}' is blocked by approval policy",
+                    name
+                )));
+            }
+            ApprovalLevel::RequireApproval => {
+                // 生成审批请求 ID 并等待审批结果
+                let call_id = uuid::Uuid::new_v4().to_string();
+                let rx = self.approval.request_approval(&call_id).await;
+
+                // 注册待审批请求（CLI 或 TUI 端会调用 approve/reject）
+                tracing::info!(
+                    "Tool '{}' requires approval (request_id={})",
+                    name,
+                    call_id
+                );
+
+                // 等待审批结果
+                match rx.await {
+                    Ok(true) => {
+                        tracing::info!("Tool '{}' approved", name);
+                    }
+                    Ok(false) => {
+                        return Err(ToolError::PermissionDenied(format!(
+                            "Tool '{}' execution was rejected",
+                            name
+                        )));
+                    }
+                    Err(_) => {
+                        return Err(ToolError::PermissionDenied(format!(
+                            "Tool '{}' approval channel closed",
+                            name
+                        )));
+                    }
+                }
+            }
+            ApprovalLevel::AutoApprove => {}
+        }
+
+        // 也检查 context 中的审批级别
+        match context.approval_level {
+            ApprovalLevel::Blocked => {
+                return Err(ToolError::PermissionDenied(format!(
+                    "Context blocks tool execution: '{}'",
+                    name
+                )));
+            }
+            ApprovalLevel::RequireApproval => {
+                // context 级别的审批与工具级别类似
+                let call_id = uuid::Uuid::new_v4().to_string();
+                let rx = self.approval.request_approval(&call_id).await;
+                tracing::info!(
+                    "Context requires approval for '{}' (request_id={})",
+                    name,
+                    call_id
+                );
+                match rx.await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(ToolError::PermissionDenied(format!(
+                            "Tool '{}' rejected by context approval",
+                            name
+                        )));
+                    }
+                    Err(_) => {
+                        return Err(ToolError::PermissionDenied(format!(
+                            "Tool '{}' context approval channel closed",
+                            name
+                        )));
+                    }
+                }
+            }
+            ApprovalLevel::AutoApprove => {}
+        }
+
         handler.execute(arguments, context).await
     }
 }
@@ -95,5 +192,30 @@ mod tests {
         let ctx = ToolContext::new("s1", SessionSource::cli());
         let result = registry.execute("dummy", "{}", &ctx).await.unwrap();
         assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_execute_blocked_tool() {
+        let registry = ToolRegistry::new();
+        registry.register(Arc::new(DummyTool)).await;
+        registry.approval_manager().set_level("dummy", ApprovalLevel::Blocked).await;
+
+        let ctx = ToolContext::new("s1", SessionSource::cli());
+        let result = registry.execute("dummy", "{}", &ctx).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("blocked"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_blocked_context() {
+        let registry = ToolRegistry::new();
+        registry.register(Arc::new(DummyTool)).await;
+
+        let ctx = ToolContext::new("s1", SessionSource::cli())
+            .with_approval(ApprovalLevel::Blocked);
+        let result = registry.execute("dummy", "{}", &ctx).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("blocks"));
     }
 }

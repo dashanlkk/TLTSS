@@ -48,6 +48,12 @@ enum Commands {
         #[command(subcommand)]
         action: SecurityCommands,
     },
+    /// Start HTTP gateway server
+    Gateway {
+        /// Bind address (default: 0.0.0.0:8080)
+        #[arg(long, default_value = "0.0.0.0:8080")]
+        addr: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -72,6 +78,21 @@ enum CronCommands {
     List,
     /// Run a job immediately
     Run { id: String },
+    /// Create a new cron job
+    Create {
+        /// Job name
+        #[arg(long)]
+        name: String,
+        /// Cron expression (e.g. "0 */5 * * * *")
+        #[arg(long)]
+        cron: String,
+        /// Command to execute
+        #[arg(long)]
+        command: Option<String>,
+        /// Message to send (alternative to --command)
+        #[arg(long)]
+        message: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -252,11 +273,17 @@ async fn main() -> anyhow::Result<()> {
         Commands::Cron { action } => match action {
             CronCommands::List => list_cron_jobs().await?,
             CronCommands::Run { id } => run_cron_job(&id).await?,
+            CronCommands::Create { name, cron, command, message } => {
+                create_cron_job(&name, &cron, command, message).await?;
+            }
         },
         Commands::Security { action } => match action {
             SecurityCommands::Audit { path, prompt } => {
                 run_security_audit(path, prompt)?;
             }
+        },
+        Commands::Gateway { addr } => {
+            run_gateway(&addr).await?;
         },
     }
 
@@ -265,7 +292,7 @@ async fn main() -> anyhow::Result<()> {
 
 // ── Chat 命令 ─────────────────────────────────────────────────────
 
-async fn run_chat(config: &AppConfig, tui: bool, _stream: bool) -> anyhow::Result<()> {
+async fn run_chat(config: &AppConfig, tui: bool, stream: bool) -> anyhow::Result<()> {
     use hermes_agent::{Agent, MemoryStore};
     use hermes_agent::agent::AgentConfig;
 
@@ -304,9 +331,70 @@ async fn run_chat(config: &AppConfig, tui: bool, _stream: bool) -> anyhow::Resul
 
     if tui {
         run_tui_chat(agent).await
+    } else if stream {
+        run_stream_chat(agent).await
     } else {
         run_reedline_chat(agent).await
     }
+}
+
+/// Streaming 模式：逐 token 输出
+async fn run_stream_chat(agent: Agent) -> anyhow::Result<()> {
+    use reedline::{DefaultPrompt, Reedline, Signal};
+
+    println!("Hermes Agent v0.1.0 (streaming mode)");
+    println!("Type 'exit' to quit.\n");
+
+    let mut line_editor = Reedline::create();
+    let prompt = DefaultPrompt::default();
+    let agent = Arc::new(tokio::sync::Mutex::new(agent));
+
+    loop {
+        let sig = line_editor.read_line(&prompt);
+        match sig {
+            Ok(Signal::Success(buffer)) => {
+                let trimmed = buffer.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed == "exit" || trimmed == "quit" {
+                    println!("Goodbye!");
+                    break;
+                }
+
+                let input = trimmed.to_string();
+                let guard = agent.lock().await;
+                let result = guard
+                    .chat_stream(&input, hermes_cfg::platform::SessionSource::cli(), |token| {
+                        print!("{}", token);
+                        use std::io::Write;
+                        let _ = std::io::stdout().flush();
+                    })
+                    .await;
+
+                println!(); // 换行
+                drop(guard);
+                match result {
+                    Ok(_msg) => {}
+                    Err(e) => eprintln!("Error: {}\n", e),
+                }
+            }
+            Ok(Signal::CtrlC) => {
+                println!("\nGoodbye!");
+                break;
+            }
+            Ok(Signal::CtrlD) => {
+                println!("\nGoodbye!");
+                break;
+            }
+            Err(e) => {
+                eprintln!("Input error: {}", e);
+                break;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// TUI 模式：使用 ratatui 界面
@@ -586,6 +674,39 @@ async fn run_cron_job(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn create_cron_job(
+    name: &str,
+    cron_expr: &str,
+    command: Option<String>,
+    message: Option<String>,
+) -> anyhow::Result<()> {
+    use hermes_cron::job::{CronJob, JobPayload};
+
+    let payload = match (command, message) {
+        (Some(cmd), _) => JobPayload::Command { command: cmd },
+        (None, Some(msg)) => JobPayload::Message { text: msg },
+        (None, None) => {
+            anyhow::bail!("Either --command or --message is required");
+        }
+    };
+
+    let job = CronJob::new(name, cron_expr, payload);
+    let scheduler = create_scheduler().await;
+
+    match scheduler.add_job(job).await {
+        Ok(id) => {
+            println!("Created cron job:");
+            println!("  ID: {}", id);
+            println!("  Name: {}", name);
+            println!("  Schedule: {}", cron_expr);
+        }
+        Err(e) => {
+            println!("Failed to create job: {}", e);
+        }
+    }
+    Ok(())
+}
+
 // ── Security 命令 ─────────────────────────────────────────────────
 
 fn run_security_audit(path: Option<String>, prompt: Option<String>) -> anyhow::Result<()> {
@@ -612,5 +733,56 @@ fn run_security_audit(path: Option<String>, prompt: Option<String>) -> anyhow::R
         println!("  --path   Validate a file path for traversal attacks");
         println!("  --prompt Scan text for prompt injection patterns");
     }
+    Ok(())
+}
+
+// ── Gateway 命令 ──────────────────────────────────────────────────
+
+async fn run_gateway(addr: &str) -> anyhow::Result<()> {
+    use hermes_gateway::api::AppState;
+    use hermes_gateway::GatewayManager;
+    use tokio::sync::mpsc;
+
+    let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+    let state = AppState::new(gateway_tx.clone());
+
+    // 注册已配置的平台适配器
+    let mut manager = GatewayManager::new();
+
+    // API 适配器总是注册
+    manager.with_api(gateway_tx.clone());
+
+    // Telegram（如果配置了 token）
+    if let Ok(token) = std::env::var("TELEGRAM_BOT_TOKEN") {
+        manager.with_telegram(&token, gateway_tx.clone());
+        println!("Telegram adapter registered");
+    }
+
+    // Discord（如果配置了 token 和 channel）
+    if let (Ok(token), Ok(channel)) = (
+        std::env::var("DISCORD_BOT_TOKEN"),
+        std::env::var("DISCORD_CHANNEL_ID"),
+    ) {
+        manager.with_discord(&token, &channel, gateway_tx.clone());
+        println!("Discord adapter registered");
+    }
+
+    // Slack（如果配置了 token 和 channel）
+    if let (Ok(token), Ok(channel)) = (
+        std::env::var("SLACK_BOT_TOKEN"),
+        std::env::var("SLACK_CHANNEL_ID"),
+    ) {
+        manager.with_slack(&token, &channel, gateway_tx.clone());
+        println!("Slack adapter registered");
+    }
+
+    // 启动所有适配器
+    manager.start_all().await?;
+
+    // 启动 HTTP 服务器
+    println!("Starting gateway server on {}", addr);
+    hermes_gateway::api::serve(state, addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("Gateway server error: {}", e))?;
     Ok(())
 }

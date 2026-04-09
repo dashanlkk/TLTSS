@@ -14,3 +14,4 @@ async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 schemars = { workspace = true }
+uuid = { workspace = true }
