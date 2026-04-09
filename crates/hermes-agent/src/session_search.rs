@@ -94,7 +94,7 @@ impl SessionSearcher {
 fn make_snippet(content: &str, query_lower: &str, radius: usize) -> String {
     let content_lower = content.to_lowercase();
     if let Some(pos) = content_lower.find(query_lower) {
-        let start = if pos > radius { pos - radius } else { 0 };
+        let start = pos.saturating_sub(radius);
         let end = (pos + query_lower.len() + radius).min(content.len());
 
         let mut snippet = String::new();

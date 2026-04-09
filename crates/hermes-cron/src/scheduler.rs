@@ -10,6 +10,10 @@ use tracing::{info, warn};
 
 use crate::job::{CronJob, JobPayload, JobRun, RunStatus};
 
+/// Type alias for the message handler callback.
+/// Takes message text, returns the agent's response or an error.
+type MessageHandler = Box<dyn Fn(String) -> futures::future::BoxFuture<'static, Result<String, String>> + Send + Sync>;
+
 /// 定时任务调度器
 pub struct Scheduler {
     jobs: Arc<RwLock<HashMap<String, CronJob>>>,
@@ -17,6 +21,8 @@ pub struct Scheduler {
     terminal: Arc<dyn TerminalBackend>,
     data_dir: PathBuf,
     running: Arc<RwLock<bool>>,
+    /// Optional handler for message payloads (routes through Agent)
+    message_handler: Option<Arc<MessageHandler>>,
 }
 
 impl Scheduler {
@@ -27,7 +33,20 @@ impl Scheduler {
             terminal,
             data_dir: PathBuf::from(".hermes/cron"),
             running: Arc::new(RwLock::new(false)),
+            message_handler: None,
         }
+    }
+
+    /// Set a handler for message payloads.
+    /// When set, message-type cron jobs will be processed through this handler
+    /// (typically routing through the Agent) instead of just returning the raw text.
+    pub fn with_message_handler<F, Fut>(mut self, handler: F) -> Self
+    where
+        F: Fn(String) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<String, String>> + Send + 'static,
+    {
+        self.message_handler = Some(Arc::new(Box::new(move |msg| Box::pin(handler(msg)))));
+        self
     }
 
     /// 设置数据持久化目录
@@ -90,8 +109,22 @@ impl Scheduler {
                     .map_err(|e| CronError::ExecutionFailed(e.to_string()))
             }
             JobPayload::Message { text } => {
-                // 消息类型记录为执行成功，具体路由由 Agent 层处理
-                Ok(hermes_cfg::traits::TerminalOutput::success(text.clone()))
+                // If a message handler is set, route through it (Agent)
+                if let Some(handler) = &self.message_handler {
+                    match handler(text.clone()).await {
+                        Ok(response) => {
+                            Ok(hermes_cfg::traits::TerminalOutput::success(response))
+                        }
+                        Err(e) => {
+                            Err(CronError::ExecutionFailed(
+                                format!("Message handler failed: {}", e)
+                            ))
+                        }
+                    }
+                } else {
+                    // Fallback: just return the text as output
+                    Ok(hermes_cfg::traits::TerminalOutput::success(text.clone()))
+                }
             }
         };
 
@@ -176,6 +209,7 @@ impl Scheduler {
         let runs = self.runs.clone();
         let terminal = self.terminal.clone();
         let is_running = self.running.clone();
+        let message_handler = self.message_handler.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
@@ -218,7 +252,20 @@ impl Scheduler {
                                         .map_err(|e| CronError::ExecutionFailed(e.to_string()))
                                 }
                                 JobPayload::Message { text } => {
-                                    Ok(hermes_cfg::traits::TerminalOutput::success(text.clone()))
+                                    if let Some(handler) = &message_handler {
+                                        match handler(text.clone()).await {
+                                            Ok(response) => {
+                                                Ok(hermes_cfg::traits::TerminalOutput::success(response))
+                                            }
+                                            Err(e) => {
+                                                Err(CronError::ExecutionFailed(
+                                                    format!("Message handler failed: {}", e)
+                                                ))
+                                            }
+                                        }
+                                    } else {
+                                        Ok(hermes_cfg::traits::TerminalOutput::success(text.clone()))
+                                    }
                                 }
                             };
 
@@ -295,7 +342,7 @@ mod tests {
         let scheduler = Scheduler::new(terminal);
 
         let job = CronJob::new("echo_test", "0 * * * * *", JobPayload::Command {
-            command: if cfg!(target_os = "windows") { "echo test123" } else { "echo test123" }.into(),
+            command: "echo test123".into(),
         });
         let id = scheduler.add_job(job).await.unwrap();
         let run = scheduler.run_now(&id).await.unwrap();

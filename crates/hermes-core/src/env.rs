@@ -2,7 +2,7 @@ use tracing::info;
 
 /// 加载 .env 文件并打印脱敏摘要
 pub fn load_env() {
-    if let Err(_) = dotenvy::dotenv() {
+    if dotenvy::dotenv().is_err() {
         info!("No .env file found, using system environment");
     }
     print_env_summary();

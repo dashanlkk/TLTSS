@@ -369,7 +369,6 @@ impl LlmClient for OpenAIClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt;
 
     #[test]
     fn test_messages_to_api_roles() {

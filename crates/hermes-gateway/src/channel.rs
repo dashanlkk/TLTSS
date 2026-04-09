@@ -15,6 +15,12 @@ pub struct GatewayChannel {
     rx: Option<mpsc::UnboundedReceiver<GatewayMessage>>,
 }
 
+impl Default for GatewayChannel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GatewayChannel {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();

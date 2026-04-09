@@ -25,6 +25,12 @@ pub struct TraceCollector {
     traces: RwLock<HashMap<String, Trace>>,
 }
 
+impl Default for TraceCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TraceCollector {
     pub fn new() -> Self {
         Self {

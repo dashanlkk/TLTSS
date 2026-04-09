@@ -9,6 +9,12 @@ pub struct ApprovalManager {
     levels: Arc<RwLock<HashMap<String, ApprovalLevel>>>,
 }
 
+impl Default for ApprovalManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ApprovalManager {
     pub fn new() -> Self {
         Self {
@@ -84,7 +90,7 @@ mod tests {
         let rx = mgr.request_approval("call_1").await;
         assert!(mgr.pending_ids().await.contains(&"call_1".to_string()));
         mgr.approve("call_1").await;
-        assert_eq!(rx.await.unwrap(), true);
+        assert!(rx.await.unwrap());
         assert!(mgr.pending_ids().await.is_empty());
     }
 
@@ -93,7 +99,7 @@ mod tests {
         let mgr = ApprovalManager::new();
         let rx = mgr.request_approval("call_2").await;
         mgr.reject("call_2").await;
-        assert_eq!(rx.await.unwrap(), false);
+        assert!(!rx.await.unwrap());
     }
 
     #[tokio::test]

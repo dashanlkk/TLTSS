@@ -34,6 +34,12 @@ pub struct MemoryStore {
     idf_cache: RwLock<HashMap<String, f64>>,
 }
 
+impl Default for MemoryStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemoryStore {
     pub fn new() -> Self {
         Self {

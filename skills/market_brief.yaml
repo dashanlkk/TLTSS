@@ -1,0 +1,16 @@
+name: market_brief
+version: "1.0"
+description: "Fetch a quick market briefing from financial websites"
+trigger_patterns:
+  - "market brief"
+  - "market briefing"
+  - "A股简报"
+  - "股市简报"
+  - "行情简报"
+steps:
+  - action: web_fetch
+    params:
+      url: "https://finance.eastmoney.com/a/czqyw.html"
+  - action: read_file
+    params:
+      path: "skills/market_brief.yaml"

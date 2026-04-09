@@ -112,7 +112,7 @@ async fn test_anthropic_streaming() {
                     Ok(StreamEvent::Reasoning(r)) => {
                         println!("Reasoning: {}", r);
                     }
-                    Ok(StreamEvent::ToolCall { id, name, arguments }) => {
+                    Ok(StreamEvent::ToolCall { id: _, name, arguments }) => {
                         println!("ToolCall: {}({})", name, arguments);
                     }
                     Ok(StreamEvent::Done) => {

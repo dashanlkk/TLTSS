@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use hermes_agent::Agent;
 use hermes_core::config::AppConfig;
-use hermes_core::provider::{ProviderRegistry, ProviderType};
+use hermes_core::provider::{ProviderConfig, ProviderRegistry, ProviderType};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -30,6 +30,9 @@ enum Commands {
         /// Use streaming mode
         #[arg(long)]
         stream: bool,
+        /// One-shot message (non-interactive, prints reply and exits)
+        #[arg(short, long)]
+        message: Option<String>,
     },
     /// Show current configuration
     Config {
@@ -165,7 +168,42 @@ fn load_config(cli_path: Option<&str>) -> AppConfig {
 
 // ── 组件初始化 ────────────────────────────────────────────────────
 
+/// 从 ProviderConfig 创建具体客户端
+fn build_provider_client(cfg: &ProviderConfig) -> Arc<dyn hermes_cfg::traits::LlmClient> {
+    let api_key = cfg.api_key.as_deref().unwrap_or("");
+    if api_key.is_empty() {
+        return Arc::new(hermes_llm::FakeClient::new(
+            "No API key configured.",
+        ));
+    }
+
+    match cfg.provider_type {
+        ProviderType::Anthropic => {
+            let base = cfg.base_url.clone().unwrap_or_else(|| "https://api.anthropic.com".to_string());
+            Arc::new(
+                hermes_llm::AnthropicClient::new(&base, api_key, &cfg.model)
+                    .with_max_tokens(cfg.max_tokens)
+                    .with_temperature(cfg.temperature)
+                    .with_prompt_caching(),
+            )
+        }
+        ProviderType::Openai => {
+            let base = cfg.base_url.clone().unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+            Arc::new(
+                hermes_llm::OpenAIClient::new(&base, api_key, &cfg.model)
+                    .with_max_tokens(cfg.max_tokens)
+                    .with_temperature(cfg.temperature),
+            )
+        }
+    }
+}
+
 /// 创建 LLM 客户端：使用 ProviderRegistry 自动检测或 CLI --provider 指定
+///
+/// 策略：
+/// 1. 如果有多个 provider 且有 fallback 配置 → FallbackClient(primary, fallback)
+/// 2. 如果只有一个 provider → 直接使用
+/// 3. 否则 → FakeClient
 fn create_llm_client(config: &AppConfig, provider_name: Option<&str>) -> Arc<dyn hermes_cfg::traits::LlmClient> {
     let registry = ProviderRegistry::from_app_config(config);
 
@@ -182,45 +220,47 @@ fn create_llm_client(config: &AppConfig, provider_name: Option<&str>) -> Arc<dyn
         registry.default_provider().map(|(n, c)| (n.clone(), c.clone()))
     };
 
-    match resolved {
-        Some((name, cfg)) => {
-            let api_key = cfg.api_key.as_deref().unwrap_or("");
-            if api_key.is_empty() {
-                tracing::warn!("Provider '{}' has no API key, using FakeClient", name);
-                return Arc::new(hermes_llm::FakeClient::new(
-                    "Hello! I'm Hermes (fake mode). Set API key for real LLM.",
-                ));
-            }
+    let Some((name, cfg)) = resolved else {
+        tracing::info!("No provider configured, using FakeClient");
+        return Arc::new(hermes_llm::FakeClient::new(
+            "Hello! I'm Hermes (fake mode). Set ANTHROPIC_API_KEY or OPENAI_API_KEY for real LLM.",
+        ));
+    };
 
-            match cfg.provider_type {
-                ProviderType::Anthropic => {
-                    let base = cfg.base_url.unwrap_or_else(|| "https://api.anthropic.com".to_string());
-                    tracing::info!("Using Anthropic provider '{}' (model: {}, base: {})", name, cfg.model, base);
-                    Arc::new(
-                        hermes_llm::AnthropicClient::new(&base, api_key, &cfg.model)
-                            .with_max_tokens(cfg.max_tokens)
-                            .with_temperature(cfg.temperature)
-                            .with_prompt_caching(),
-                    )
-                }
-                ProviderType::Openai => {
-                    let base = cfg.base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-                    tracing::info!("Using OpenAI provider '{}' (model: {}, base: {})", name, cfg.model, base);
-                    Arc::new(
-                        hermes_llm::OpenAIClient::new(&base, api_key, &cfg.model)
-                            .with_max_tokens(cfg.max_tokens)
-                            .with_temperature(cfg.temperature),
-                    )
-                }
+    let api_key = cfg.api_key.as_deref().unwrap_or("");
+    if api_key.is_empty() {
+        tracing::warn!("Provider '{}' has no API key, using FakeClient", name);
+        return Arc::new(hermes_llm::FakeClient::new(
+            "Hello! I'm Hermes (fake mode). Set API key for real LLM.",
+        ));
+    }
+
+    let primary = build_provider_client(&cfg);
+    tracing::info!("Primary provider: '{}' (model: {})", name, cfg.model);
+
+    // Check for fallback provider: if there's a second provider in the registry
+    let other_providers: Vec<_> = registry.names()
+        .into_iter()
+        .filter(|n| n != &name)
+        .collect();
+
+    if !other_providers.is_empty() {
+        // Use the first non-primary as fallback
+        if let Some(fallback_cfg) = registry.get(&other_providers[0]) {
+            if fallback_cfg.api_key.as_deref().unwrap_or("") != "" {
+                let fallback_client = build_provider_client(fallback_cfg);
+                tracing::info!(
+                    "Fallback provider: '{}' (model: {}) — wrapping in FallbackClient",
+                    other_providers[0], fallback_cfg.model
+                );
+                return Arc::new(
+                    hermes_llm::FallbackClient::new(primary, fallback_client)
+                );
             }
-        }
-        None => {
-            tracing::info!("No provider configured, using FakeClient");
-            Arc::new(hermes_llm::FakeClient::new(
-                "Hello! I'm Hermes (fake mode). Set ANTHROPIC_API_KEY or OPENAI_API_KEY for real LLM.",
-            ))
         }
     }
+
+    primary
 }
 
 /// 创建工具注册表并注册内置工具
@@ -307,8 +347,8 @@ async fn main() -> anyhow::Result<()> {
     let provider_override = cli.provider.as_deref();
 
     match cli.command {
-        Commands::Chat { tui, stream } => {
-            run_chat(&config, tui, stream, provider_override).await?;
+        Commands::Chat { tui, stream, message } => {
+            run_chat(&config, tui, stream, message, provider_override).await?;
         }
         Commands::Config { action } => match action {
             ConfigCommands::Show => show_config(&config)?,
@@ -343,7 +383,7 @@ async fn main() -> anyhow::Result<()> {
 
 // ── Chat 命令 ─────────────────────────────────────────────────────
 
-async fn run_chat(config: &AppConfig, tui: bool, stream: bool, provider: Option<&str>) -> anyhow::Result<()> {
+async fn run_chat(config: &AppConfig, tui: bool, stream: bool, one_shot: Option<String>, provider: Option<&str>) -> anyhow::Result<()> {
     use hermes_agent::{Agent, MemoryStore};
     use hermes_agent::agent::AgentConfig;
 
@@ -351,6 +391,38 @@ async fn run_chat(config: &AppConfig, tui: bool, stream: bool, provider: Option<
     let llm = create_llm_client(config, provider);
     let registry = create_tool_registry(config, terminal).await;
     let memory = Arc::new(MemoryStore::new());
+
+    // 注册 delegate_task 工具（需要 llm + registry + memory）
+    registry
+        .register(Arc::new(hermes_agent::DelegateTaskTool::new(
+            llm.clone(),
+            registry.clone(),
+            memory.clone(),
+            0, // depth=0 for top-level agent
+        )))
+        .await;
+
+    // 注册审批回调（CLI 模式下通过 stdin 交互）
+    registry.set_approval_callback(|tool_name, args| {
+        // 截断过长的参数
+        let args_preview = if args.len() > 100 {
+            format!("{}...", &args[..100])
+        } else {
+            args.to_string()
+        };
+        println!("\n⚠️  Tool approval required: {}({})", tool_name, args_preview);
+        println!("   [y/n] (default: y): ");
+        use std::io::{self, BufRead, Write};
+        let _ = io::stdout().flush();
+        let mut input = String::new();
+        match io::stdin().lock().read_line(&mut input) {
+            Ok(_) => {
+                let answer = input.trim().to_lowercase();
+                answer != "n" && answer != "no"
+            }
+            Err(_) => true, // 默认允许
+        }
+    }).await;
 
     // 加载技能
     let skills = load_skills();
@@ -378,9 +450,29 @@ async fn run_chat(config: &AppConfig, tui: bool, stream: bool, provider: Option<
         ..AgentConfig::default()
     };
 
-    let agent = Agent::new(agent_config, llm, registry, memory);
+    let agent = Agent::new(agent_config, llm, registry, memory).with_skills(skill_manifests);
 
-    if tui {
+    if let Some(msg) = one_shot {
+        // 单次模式：发送消息，输出回复，退出
+        if stream {
+            agent
+                .chat_stream(&msg, hermes_cfg::platform::SessionSource::cli(), |token| {
+                    print!("{}", token);
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            println!();
+        } else {
+            let reply = agent
+                .chat(&msg, hermes_cfg::platform::SessionSource::cli())
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            println!("{}", reply.content);
+        }
+        Ok(())
+    } else if tui {
         run_tui_chat(agent).await
     } else if stream {
         run_stream_chat(agent).await

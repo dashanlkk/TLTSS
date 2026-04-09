@@ -246,7 +246,7 @@ impl ToolHandler for SearchFilesTool {
         let mut results = Vec::new();
         let mut count = 0usize;
 
-        search_recursive(&validated, &pattern, &pattern_lower, case_sensitive, max_results, &mut results, &mut count).await?;
+        search_recursive(&validated, pattern, &pattern_lower, case_sensitive, max_results, &mut results, &mut count).await?;
 
         if results.is_empty() {
             Ok(ToolResult::success("search_files", "No matches found."))
@@ -288,11 +288,8 @@ async fn search_recursive(
             Box::pin(search_recursive(&path, pattern, pattern_lower, case_sensitive, max_results, results, count)).await?;
         } else if path.is_file() {
             // Skip binary-ish extensions
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                match ext {
-                    "exe" | "dll" | "so" | "dylib" | "png" | "jpg" | "jpeg" | "gif" | "zip" | "tar" | "gz" => continue,
-                    _ => {}
-                }
+            if let Some("exe" | "dll" | "so" | "dylib" | "png" | "jpg" | "jpeg" | "gif" | "zip" | "tar" | "gz") = path.extension().and_then(|e| e.to_str()) {
+                continue;
             }
 
             if is_sensitive_file(&path.to_string_lossy()) { continue; }
@@ -327,6 +324,10 @@ async fn search_recursive(
 
 /// 内置工具：HTTP GET 获取网页内容
 pub struct WebFetchTool;
+
+impl Default for WebFetchTool {
+    fn default() -> Self { Self::new() }
+}
 
 impl WebFetchTool {
     pub fn new() -> Self { Self }
@@ -509,6 +510,10 @@ impl ToolHandler for TodoTool {
 /// 内置工具：向用户提问澄清
 pub struct ClarifyTool;
 
+impl Default for ClarifyTool {
+    fn default() -> Self { Self::new() }
+}
+
 impl ClarifyTool {
     pub fn new() -> Self { Self }
 }
@@ -630,7 +635,7 @@ mod tests {
             hermes_terminal::backend::LocalBackend::new(std::env::temp_dir())
         );
         let tool = ExecuteCommandTool::new(terminal);
-        let cmd = if cfg!(target_os = "windows") { "echo hello" } else { "echo hello" };
+        let cmd = "echo hello";
         let args = serde_json::json!({"command": cmd}).to_string();
         let result = tool.execute(&args, &test_ctx()).await.unwrap();
         assert!(result.content.contains("hello"));

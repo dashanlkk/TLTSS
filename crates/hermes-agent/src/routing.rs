@@ -151,7 +151,7 @@ impl ModelRouter {
         let total_chars: usize = messages.iter().map(|m| m.content.len()).sum();
         let has_tool_history = messages.iter().any(|m| {
             m.role == Role::Assistant
-                && m.tool_calls.as_ref().map_or(false, |c| !c.is_empty())
+                && m.tool_calls.as_ref().is_some_and(|c| !c.is_empty())
         });
 
         RoutingContext {

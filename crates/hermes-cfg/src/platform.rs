@@ -19,6 +19,26 @@ pub struct SessionSource {
     pub chat_id: String,
 }
 
+impl Platform {
+    /// Get platform name as lowercase string for routing.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Platform::Cli => "cli",
+            Platform::Telegram => "telegram",
+            Platform::Discord => "discord",
+            Platform::Slack => "slack",
+            Platform::Api => "api",
+            Platform::Cron => "cron",
+        }
+    }
+}
+
+impl std::fmt::Display for Platform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl SessionSource {
     pub fn cli() -> Self {
         Self {

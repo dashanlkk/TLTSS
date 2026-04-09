@@ -141,7 +141,7 @@ impl Agent {
         let mut current_messages = messages;
         let mut rounds = 0;
         let mut iterations = 0;
-        let mut compression_config = CompressionConfig::default();
+        let compression_config = CompressionConfig::default();
 
         loop {
             if rounds >= self.config.max_tool_rounds {
@@ -261,7 +261,7 @@ impl Agent {
                                         },
                                     )
                                     .await;
-                                let msg = Message::new_tool_result(&call_id, &e.to_string());
+                                let msg = Message::new_tool_result(&call_id, e.to_string());
                                 current_messages.push(msg.clone());
                                 session.push_message(msg);
                             }
@@ -412,7 +412,7 @@ impl Agent {
                                     .await;
                             }
                             Err(e) => {
-                                let msg = Message::new_tool_result(&call.id, &e.to_string());
+                                let msg = Message::new_tool_result(&call.id, e.to_string());
                                 session.push_message(msg);
                                 self.trace
                                     .event(
@@ -504,6 +504,25 @@ impl Agent {
     /// 获取 trace 收集器
     pub fn trace_collector(&self) -> Arc<TraceCollector> {
         self.trace.clone()
+    }
+
+    /// Clone for gateway use — creates a new Agent sharing the same
+    /// LLM, registry, and memory, but with a fresh session state.
+    /// Used by GatewayRunner to create per-session agents that share
+    /// the same underlying resources.
+    pub fn clone_for_gateway(&self) -> Self {
+        Self {
+            config: AgentConfig {
+                system_prompt: self.config.system_prompt.clone(),
+                ..AgentConfig::default()
+            },
+            llm: self.llm.clone(),
+            registry: self.registry.clone(),
+            memory: self.memory.clone(),
+            skills: self.skills.clone(),
+            sessions: RwLock::new(Vec::new()),
+            trace: Arc::new(TraceCollector::new()),
+        }
     }
 }
 

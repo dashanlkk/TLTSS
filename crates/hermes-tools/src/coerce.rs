@@ -95,7 +95,7 @@ mod tests {
 
     #[test]
     fn test_coerce_string_to_float() {
-        assert_eq!(coerce_value(&json!("3.14"), "number"), json!(3.14));
+        assert_eq!(coerce_value(&json!("2.71"), "number"), json!(2.71));
     }
 
     #[test]

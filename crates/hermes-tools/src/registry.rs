@@ -6,10 +6,21 @@ use tokio::sync::RwLock;
 
 use crate::approval::ApprovalManager;
 
+/// Approval callback type: takes (tool_name, arguments) → bool (true = approve)
+type ApprovalCallback = Box<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
 /// 线程安全的工具注册表
 pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn ToolHandler>>>,
     approval: Arc<ApprovalManager>,
+    /// Optional synchronous approval callback for CLI integration
+    approval_callback: RwLock<Option<Arc<ApprovalCallback>>>,
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ToolRegistry {
@@ -17,6 +28,7 @@ impl ToolRegistry {
         Self {
             tools: RwLock::new(HashMap::new()),
             approval: Arc::new(ApprovalManager::new()),
+            approval_callback: RwLock::new(None),
         }
     }
 
@@ -25,7 +37,18 @@ impl ToolRegistry {
         Self {
             tools: RwLock::new(HashMap::new()),
             approval,
+            approval_callback: RwLock::new(None),
         }
+    }
+
+    /// Set a synchronous approval callback (works through Arc).
+    /// When a tool requires approval, this callback is invoked with (tool_name, arguments).
+    /// Return true to approve, false to reject.
+    pub async fn set_approval_callback<F>(&self, callback: F)
+    where
+        F: Fn(&str, &str) -> bool + Send + Sync + 'static,
+    {
+        *self.approval_callback.write().await = Some(Arc::new(Box::new(callback)));
     }
 
     /// 获取审批管理器引用
@@ -78,33 +101,42 @@ impl ToolRegistry {
                 )));
             }
             ApprovalLevel::RequireApproval => {
-                // 生成审批请求 ID 并等待审批结果
-                let call_id = uuid::Uuid::new_v4().to_string();
-                let rx = self.approval.request_approval(&call_id).await;
-
-                // 注册待审批请求（CLI 或 TUI 端会调用 approve/reject）
-                tracing::info!(
-                    "Tool '{}' requires approval (request_id={})",
-                    name,
-                    call_id
-                );
-
-                // 等待审批结果
-                match rx.await {
-                    Ok(true) => {
-                        tracing::info!("Tool '{}' approved", name);
-                    }
-                    Ok(false) => {
+                // Try callback first (for CLI integration)
+                let cb = self.approval_callback.read().await.clone();
+                if let Some(callback) = cb {
+                    let approved = callback(name, arguments);
+                    if !approved {
                         return Err(ToolError::PermissionDenied(format!(
-                            "Tool '{}' execution was rejected",
+                            "Tool '{}' execution was rejected by user",
                             name
                         )));
                     }
-                    Err(_) => {
-                        return Err(ToolError::PermissionDenied(format!(
-                            "Tool '{}' approval channel closed",
-                            name
-                        )));
+                    tracing::info!("Tool '{}' approved via callback", name);
+                } else {
+                    // Fallback: use channel-based approval (for TUI/Gateway)
+                    let call_id = uuid::Uuid::new_v4().to_string();
+                    let rx = self.approval.request_approval(&call_id).await;
+                    tracing::info!(
+                        "Tool '{}' requires approval (request_id={})",
+                        name,
+                        call_id
+                    );
+                    match rx.await {
+                        Ok(true) => {
+                            tracing::info!("Tool '{}' approved", name);
+                        }
+                        Ok(false) => {
+                            return Err(ToolError::PermissionDenied(format!(
+                                "Tool '{}' execution was rejected",
+                                name
+                            )));
+                        }
+                        Err(_) => {
+                            return Err(ToolError::PermissionDenied(format!(
+                                "Tool '{}' approval channel closed",
+                                name
+                            )));
+                        }
                     }
                 }
             }

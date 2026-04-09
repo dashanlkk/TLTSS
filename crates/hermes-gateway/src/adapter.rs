@@ -33,7 +33,7 @@ impl PlatformAdapter for ApiAdapter {
             chat_id: chat_id.to_string(),
             content: message.to_string(),
             source: SessionSource::api(),
-        }).map_err(|e| LlmError::ProviderError(e))
+        }).map_err(LlmError::ProviderError)
     }
 
     fn set_message_handler(&mut self, handler: Box<dyn Fn(String, SessionSource) + Send + Sync>) {

@@ -50,6 +50,7 @@ struct ApiTool {
 
 /// Anthropic Messages API response
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct MessagesResponse {
     content: Vec<ContentBlock>,
     #[serde(default)]
@@ -80,6 +81,7 @@ enum ContentBlock {
 
 /// Anthropic usage info
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct ApiUsage {
     input_tokens: u32,
     output_tokens: u32,
@@ -90,6 +92,7 @@ struct ApiUsage {
 /// SSE event from Anthropic streaming API
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type")]
+#[allow(dead_code)]
 enum StreamEventRaw {
     #[serde(rename = "message_start")]
     MessageStart { message: MessageStartData },
@@ -115,6 +118,7 @@ enum StreamEventRaw {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct MessageStartData {
     id: String,
     model: String,
@@ -124,6 +128,7 @@ struct MessageStartData {
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type")]
+#[allow(dead_code)]
 enum ContentBlockStartData {
     #[serde(rename = "text")]
     Text { text: String },
@@ -140,6 +145,7 @@ enum ContentBlockStartData {
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type")]
+#[allow(clippy::enum_variant_names)]
 enum ContentBlockDelta {
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
@@ -153,6 +159,7 @@ enum ContentBlockDelta {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct MessageDeltaData {
     stop_reason: Option<String>,
 }
@@ -208,6 +215,7 @@ impl AnthropicClient {
     }
 
     /// Check if this is a third-party (non-Anthropic) endpoint
+    #[allow(dead_code)]
     fn is_third_party(&self) -> bool {
         let url = self.base_url.to_lowercase();
         !url.contains("anthropic.com")

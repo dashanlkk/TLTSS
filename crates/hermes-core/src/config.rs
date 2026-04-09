@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// 应用顶层配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default)]
     pub model: ModelConfig,
@@ -127,20 +127,6 @@ pub struct SkillConfig {
 pub struct CronConfig {
     #[serde(default)]
     pub max_concurrent_jobs: u32,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            model: ModelConfig::default(),
-            terminal: TerminalConfig::default(),
-            tools: ToolsConfig::default(),
-            gateway: GatewayConfig::default(),
-            mcp: McpConfig::default(),
-            skill: SkillConfig::default(),
-            cron: CronConfig::default(),
-        }
-    }
 }
 
 impl AppConfig {

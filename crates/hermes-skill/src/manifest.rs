@@ -14,17 +14,12 @@ pub struct SkillManifest {
     pub status: SkillStatus,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillStatus {
+    #[default]
     Draft,
     Published,
-}
-
-impl Default for SkillStatus {
-    fn default() -> Self {
-        Self::Draft
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

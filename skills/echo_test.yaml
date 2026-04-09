@@ -1,0 +1,10 @@
+name: echo_test
+version: "1.0"
+description: "Simple echo test skill"
+trigger_patterns:
+  - "echo test"
+  - "回显测试"
+steps:
+  - action: execute_command
+    params:
+      command: "echo Hello from skill!"

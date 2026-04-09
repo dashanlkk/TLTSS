@@ -6,6 +6,12 @@ pub struct TuiApp {
     pub running: bool,
 }
 
+impl Default for TuiApp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TuiApp {
     pub fn new() -> Self {
         Self {

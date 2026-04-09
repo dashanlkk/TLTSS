@@ -215,6 +215,12 @@ pub struct GatewayManager {
     adapters: Vec<Box<dyn PlatformAdapter>>,
 }
 
+impl Default for GatewayManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GatewayManager {
     pub fn new() -> Self {
         Self {

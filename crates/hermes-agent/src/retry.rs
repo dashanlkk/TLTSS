@@ -116,9 +116,7 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<hermes_cfg::message::Message, LlmError>>,
 {
-    use hermes_cfg::message::Message;
-
-    let mut last_error: Option<LlmError> = None;
+    let mut _last_error: Option<LlmError> = None;
     let mut attempt = 0;
 
     loop {
@@ -159,7 +157,7 @@ where
                             "Retry {}/{} after {:?} (error: {})",
                             attempt, max_retries, delay, e
                         );
-                        last_error = Some(e);
+                        _last_error = Some(e);
                         tokio::time::sleep(delay).await;
                     }
                 }
