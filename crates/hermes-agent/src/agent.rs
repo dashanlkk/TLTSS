@@ -312,7 +312,13 @@ impl Agent {
         Ok(final_msg)
     }
 
-    /// 流式对话 — 逐 token 输出 Agent 回复（支持 tool_call）
+    /// 流式对话 — 逐 token 输出 Agent 回复（支持多轮 tool_call 循环）
+    ///
+    /// 与 `chat` 方法对齐的循环结构：
+    /// 1. 流式调用 LLM，收集 content + tool_calls
+    /// 2. 若有 tool_calls → 执行工具 → 将结果加入 current_messages → 回到步骤 1
+    /// 3. 若无 tool_calls → 返回最终回复
+    /// 4. 支持 compression、iteration budget、max_tool_rounds 限制
     pub async fn chat_stream(
         &self,
         user_message: &str,
@@ -351,116 +357,211 @@ impl Agent {
 
         let memories = self.memory.search(user_message).await;
         let builder = PromptBuilder::new(&self.config.system_prompt).with_memories(memories);
-        let messages = builder.build(&session.messages);
+        let mut current_messages = builder.build(&session.messages);
         self.trace
-            .event(&trace_id, TraceEvent::PromptBuilt(messages.len()))
+            .event(&trace_id, TraceEvent::PromptBuilt(current_messages.len()))
             .await;
 
-        // 流式调用 LLM
-        let tools = self.registry.tool_definitions().await;
+        let mut rounds = 0u32;
+        let mut iterations = 0u32;
+        let compression_config = CompressionConfig::default();
 
-        match self.llm.complete_stream(&messages, &tools).await {
-            Ok(mut stream) => {
-                let mut full_content = String::new();
-                let mut full_reasoning = String::new();
-                let mut pending_tool_calls: Vec<hermes_cfg::tool::ToolCall> = Vec::new();
+        loop {
+            // Iteration budget check
+            if iterations >= self.config.max_iterations {
+                warn!("Stream: max iterations ({}) reached", self.config.max_iterations);
+                break;
+            }
+            if rounds >= self.config.max_tool_rounds {
+                warn!("Stream: max tool rounds reached, requesting final text response");
+                // Final non-streaming call without tools
+                let final_response = {
+                    let llm = &self.llm;
+                    let msgs = &current_messages;
+                    retry::retry_llm_call(self.config.max_retries, || {
+                        let msgs = msgs.clone();
+                        async move { llm.complete(&msgs, &[]).await }
+                    }).await
+                };
+                if let Ok(resp) = final_response {
+                    on_token(&resp.content);
+                    current_messages.push(resp.clone());
+                    session.push_message(resp);
+                }
+                break;
+            }
 
-                while let Some(event) = stream.next().await {
-                    match event {
-                        Ok(StreamEvent::Delta(token)) => {
-                            on_token(&token);
-                            full_content.push_str(&token);
+            // Pre-call compression check
+            if compressor::should_compress(&current_messages, self.config.max_context_tokens, &compression_config) {
+                info!("Stream: context compression triggered");
+                let result = compressor::compress(&current_messages, self.config.max_context_tokens, &compression_config);
+                current_messages = result.messages;
+            }
+
+            // 流式调用 LLM
+            let tools = self.registry.tool_definitions().await;
+            iterations += 1;
+            self.trace.event(&trace_id, TraceEvent::LlmCallStart).await;
+
+            let stream_result = {
+                let llm = &self.llm;
+                let msgs = &current_messages;
+                let tool_defs = &tools;
+                // Stream retry — uses retry_stream_call which handles LlmError
+                retry::retry_stream_call(self.config.max_retries, || {
+                    let msgs = msgs.clone();
+                    let tool_defs = tool_defs.clone();
+                    async move { llm.complete_stream(&msgs, &tool_defs).await }
+                }).await
+            };
+
+            let mut stream = match stream_result {
+                Ok(s) => s,
+                Err(e) => {
+                    let strategy = retry::classify_error(&e);
+                    match strategy {
+                        RecoveryStrategy::Compress => {
+                            info!("Stream: context overflow, forcing compression");
+                            let compressed = compressor::compress(
+                                &current_messages,
+                                self.config.max_context_tokens / 2,
+                                &compression_config,
+                            );
+                            current_messages = compressed.messages;
+                            continue;
                         }
-                        Ok(StreamEvent::Reasoning(token)) => {
-                            full_reasoning.push_str(&token);
-                        }
-                        Ok(StreamEvent::Done) => break,
-                        Ok(StreamEvent::ToolCall {
-                            id,
-                            name,
-                            arguments,
-                        }) => {
-                            debug!("Stream tool call: {} ({})", name, id);
-                            pending_tool_calls.push(hermes_cfg::tool::ToolCall {
-                                id,
-                                call_type: "function".to_string(),
-                                function: hermes_cfg::tool::FunctionCall {
-                                    name,
-                                    arguments,
-                                },
-                            });
-                        }
-                        Err(e) => {
-                            warn!("Stream error: {}", e);
-                            break;
-                        }
+                        _ => return Err(e.into()),
                     }
                 }
+            };
 
-                let mut response = Message::new_assistant(&full_content);
+            // Collect stream events
+            let mut full_content = String::new();
+            let mut pending_tool_calls: Vec<hermes_cfg::tool::ToolCall> = Vec::new();
 
-                // 处理流式中的 tool calls
-                if !pending_tool_calls.is_empty() {
-                    response = response.with_tool_calls(pending_tool_calls.clone());
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(StreamEvent::Delta(token)) => {
+                        on_token(&token);
+                        full_content.push_str(&token);
+                    }
+                    Ok(StreamEvent::Reasoning(_token)) => {
+                        // Reasoning collected but not streamed to user
+                    }
+                    Ok(StreamEvent::Done) => break,
+                    Ok(StreamEvent::ToolCall { id, name, arguments }) => {
+                        debug!("Stream tool call: {} ({})", name, id);
+                        pending_tool_calls.push(hermes_cfg::tool::ToolCall {
+                            id,
+                            call_type: "function".to_string(),
+                            function: hermes_cfg::tool::FunctionCall {
+                                name,
+                                arguments,
+                            },
+                        });
+                    }
+                    Err(e) => {
+                        warn!("Stream error: {}", e);
+                        break;
+                    }
+                }
+            }
 
-                    // 执行工具并收集结果
-                    let ctx = ToolContext::new(&session.id, source.clone());
-                    for call in &pending_tool_calls {
-                        match self
-                            .registry
-                            .execute(&call.function.name, &call.function.arguments, &ctx)
-                            .await
-                        {
+            // Build response message
+            let mut response = Message::new_assistant(&full_content);
+            let tool_calls = if !pending_tool_calls.is_empty() {
+                response = response.with_tool_calls(pending_tool_calls);
+                response.tool_calls.clone()
+            } else {
+                None
+            };
+
+            current_messages.push(response.clone());
+            session.push_message(response.clone());
+
+            self.trace
+                .event(&trace_id, TraceEvent::LlmCallComplete(full_content))
+                .await;
+
+            // Check tool calls
+            if let Some(calls) = tool_calls {
+                if calls.is_empty() {
+                    break;
+                }
+
+                debug!("Stream: agent calls {} tool(s)", calls.len());
+
+                let ctx = ToolContext::new(&session.id, source.clone());
+                let mut join_set = tokio::task::JoinSet::new();
+                for call in calls {
+                    let registry = self.registry.clone();
+                    let ctx = ctx.clone();
+                    let tool_name = call.function.name.clone();
+                    join_set.spawn(async move {
+                        let result = registry
+                            .execute(&tool_name, &call.function.arguments, &ctx)
+                            .await;
+                        (call.id.clone(), tool_name, result)
+                    });
+                }
+
+                while let Some(res) = join_set.join_next().await {
+                    match res {
+                        Ok((call_id, tool_name, result)) => match result {
                             Ok(tool_result) => {
-                                let msg =
-                                    Message::new_tool_result(&call.id, &tool_result.content);
-                                session.push_message(msg);
                                 self.trace
-                                    .event(
-                                        &trace_id,
-                                        TraceEvent::ToolExecuted {
-                                            tool: call.function.name.clone(),
-                                            success: true,
-                                        },
-                                    )
+                                    .event(&trace_id, TraceEvent::ToolExecuted {
+                                        tool: tool_name,
+                                        success: true,
+                                    })
                                     .await;
+                                let msg = Message::new_tool_result(&call_id, &tool_result.content);
+                                current_messages.push(msg.clone());
+                                session.push_message(msg);
                             }
                             Err(e) => {
-                                let msg = Message::new_tool_result(&call.id, e.to_string());
-                                session.push_message(msg);
                                 self.trace
-                                    .event(
-                                        &trace_id,
-                                        TraceEvent::ToolExecuted {
-                                            tool: call.function.name.clone(),
-                                            success: false,
-                                        },
-                                    )
+                                    .event(&trace_id, TraceEvent::ToolExecuted {
+                                        tool: tool_name,
+                                        success: false,
+                                    })
                                     .await;
+                                let msg = Message::new_tool_result(&call_id, e.to_string());
+                                current_messages.push(msg.clone());
+                                session.push_message(msg);
                             }
+                        },
+                        Err(e) => {
+                            warn!("Stream tool task failed: {}", e);
                         }
                     }
                 }
 
-                session.push_message(response.clone());
-
-                if !user_message.is_empty() {
-                    let _ = self
-                        .memory
-                        .add(user_message, vec![user_message.to_string()])
-                        .await;
-                }
-
-                self.trace.event(&trace_id, TraceEvent::Done).await;
-                self.persist_session(session).await;
-                Ok(response)
-            }
-            Err(_) => {
-                // 流式失败时回退到普通调用
-                drop(sessions);
-                self.chat(user_message, source).await
+                rounds += 1;
+                // Loop back: next iteration will call LLM again with tool results
+            } else {
+                // No tool calls — final response
+                break;
             }
         }
+
+        // Auto-save memory
+        if !user_message.is_empty() {
+            let _ = self
+                .memory
+                .add(user_message, vec![user_message.to_string()])
+                .await;
+        }
+
+        self.trace.event(&trace_id, TraceEvent::Done).await;
+        let final_msg = session
+            .messages
+            .last()
+            .cloned()
+            .unwrap_or_else(|| Message::new_assistant("No response"));
+
+        self.persist_session(session).await;
+        Ok(final_msg)
     }
 
     /// 尝试技能触发，返回匹配技能的执行结果

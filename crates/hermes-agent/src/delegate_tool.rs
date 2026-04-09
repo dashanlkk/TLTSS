@@ -126,7 +126,7 @@ impl ToolHandler for DelegateTaskTool {
                 }
                 Err(e) => {
                     warn!("Batch delegation failed: {}", e);
-                    Ok(ToolResult::error("delegate_task", &format!("Delegation failed: {}", e)))
+                    Ok(ToolResult::error("delegate_task", format!("Delegation failed: {}", e)))
                 }
             }
         } else if let Some(goal) = params.get("goal").and_then(|v| v.as_str()) {
@@ -147,7 +147,7 @@ impl ToolHandler for DelegateTaskTool {
                 }
                 Err(e) => {
                     warn!("Single delegation failed: {}", e);
-                    Ok(ToolResult::error("delegate_task", &format!("Delegation failed: {}", e)))
+                    Ok(ToolResult::error("delegate_task", format!("Delegation failed: {}", e)))
                 }
             }
         } else {

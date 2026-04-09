@@ -247,7 +247,7 @@ fn create_llm_client(config: &AppConfig, provider_name: Option<&str>) -> Arc<dyn
     if !other_providers.is_empty() {
         // Use the first non-primary as fallback
         if let Some(fallback_cfg) = registry.get(&other_providers[0]) {
-            if fallback_cfg.api_key.as_deref().unwrap_or("") != "" {
+            if !fallback_cfg.api_key.as_deref().unwrap_or("").is_empty() {
                 let fallback_client = build_provider_client(fallback_cfg);
                 tracing::info!(
                     "Fallback provider: '{}' (model: {}) — wrapping in FallbackClient",

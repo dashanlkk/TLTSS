@@ -105,23 +105,21 @@ pub fn jittered_backoff(attempt: u32, base_delay: Duration, max_delay: Duration)
     Duration::from_millis(capped + jitter)
 }
 
-/// Retry wrapper for LLM calls with classification-based recovery.
+/// Generic retry wrapper with classification-based recovery.
 ///
-/// Returns the first successful result, or the last error if all retries exhausted.
-pub async fn retry_llm_call<F, Fut>(
-    max_retries: u32,
-    f: F,
-) -> Result<hermes_cfg::message::Message, LlmError>
+/// Works for any `Result<T, LlmError>` return type — used by both
+/// `retry_llm_call` (Message) and `retry_stream_call` (Stream).
+async fn retry_generic<F, Fut, T>(max_retries: u32, f: F) -> Result<T, LlmError>
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<hermes_cfg::message::Message, LlmError>>,
+    Fut: std::future::Future<Output = Result<T, LlmError>>,
 {
     let mut _last_error: Option<LlmError> = None;
     let mut attempt = 0;
 
     loop {
         match f().await {
-            Ok(msg) => return Ok(msg),
+            Ok(val) => return Ok(val),
             Err(e) => {
                 let strategy = classify_error(&e);
 
@@ -131,12 +129,10 @@ where
                         return Err(e);
                     }
                     RecoveryStrategy::Compress => {
-                        // Propagate the error so caller can compress and retry
                         warn!("Context overflow detected: {}", e);
                         return Err(e);
                     }
                     RecoveryStrategy::Failover => {
-                        // Propagate for caller to switch provider
                         warn!("Failover needed: {}", e);
                         return Err(e);
                     }
@@ -164,6 +160,33 @@ where
             }
         }
     }
+}
+
+/// Retry wrapper for LLM complete calls returning `Result<Message, LlmError>`.
+pub async fn retry_llm_call<F, Fut>(
+    max_retries: u32,
+    f: F,
+) -> Result<hermes_cfg::message::Message, LlmError>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<hermes_cfg::message::Message, LlmError>>,
+{
+    retry_generic(max_retries, f).await
+}
+
+/// Retry wrapper for LLM stream calls returning `Result<Stream, LlmError>`.
+///
+/// Same classification-based logic as `retry_llm_call`, but for
+/// `complete_stream` which returns a stream object instead of a Message.
+pub async fn retry_stream_call<F, Fut, S>(
+    max_retries: u32,
+    f: F,
+) -> Result<S, LlmError>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<S, LlmError>>,
+{
+    retry_generic(max_retries, f).await
 }
 
 #[cfg(test)]

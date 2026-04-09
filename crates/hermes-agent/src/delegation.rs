@@ -9,7 +9,6 @@
 //! - Batch parallel mode via JoinSet
 //! - Interrupt propagation from parent to children
 
-use hermes_cfg::message::Message;
 use hermes_cfg::platform::SessionSource;
 use hermes_cfg::traits::LlmClient;
 use hermes_tools::ToolRegistry;

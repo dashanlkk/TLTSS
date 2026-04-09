@@ -322,7 +322,7 @@ fn clean_orphaned_tool_pairs(messages: &[Message]) -> Vec<Message> {
         .flatten()
         .collect();
 
-    let result_ids: Vec<String> = messages
+    let _result_ids: Vec<String> = messages
         .iter()
         .filter_map(|m| m.tool_call_id.clone())
         .collect();
