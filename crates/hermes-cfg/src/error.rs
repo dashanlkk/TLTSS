@@ -2,6 +2,7 @@ use thiserror::Error;
 
 /// LLM 调用错误
 #[derive(Debug, Error, Clone)]
+#[non_exhaustive]
 pub enum LlmError {
     #[error("Authentication failed: {0}")]
     AuthenticationFailed(String),
@@ -21,6 +22,7 @@ pub enum LlmError {
 
 /// 工具执行错误
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ToolError {
     #[error("Tool not found: {0}")]
     NotFound(String),
@@ -42,6 +44,7 @@ pub enum ToolError {
 
 /// 终端执行错误
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum TerminalError {
     #[error("Command execution failed: {0}")]
     ExecutionFailed(String),
@@ -55,6 +58,7 @@ pub enum TerminalError {
 
 /// 配置错误
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     #[error("Config file not found: {0}")]
     FileNotFound(String),
@@ -68,6 +72,7 @@ pub enum ConfigError {
 
 /// MCP 协议错误
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum McpError {
     #[error("JSON-RPC error {code}: {message}")]
     JsonRpc { code: i32, message: String },
@@ -81,6 +86,7 @@ pub enum McpError {
 
 /// 技能系统错误
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum SkillError {
     #[error("Invalid manifest: {0}")]
     InvalidManifest(String),
@@ -94,6 +100,7 @@ pub enum SkillError {
 
 /// Cron 调度错误
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CronError {
     #[error("Invalid cron expression: {0}")]
     InvalidExpression(String),

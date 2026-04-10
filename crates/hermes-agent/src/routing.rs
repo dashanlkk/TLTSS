@@ -8,6 +8,7 @@ use hermes_cfg::prelude::*;
 
 /// 路由策略
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RoutingTier {
     /// 轻量模型（快速、便宜）
     Light,

@@ -214,13 +214,6 @@ impl AnthropicClient {
         self
     }
 
-    /// Check if this is a third-party (non-Anthropic) endpoint
-    #[allow(dead_code)]
-    fn is_third_party(&self) -> bool {
-        let url = self.base_url.to_lowercase();
-        !url.contains("anthropic.com")
-    }
-
     /// Convert Hermes messages to Anthropic format.
     ///
     /// Returns (system_prompt, messages) where system_prompt is extracted
@@ -286,7 +279,7 @@ impl AnthropicClient {
                             && blocks[0].get("type").and_then(|t| t.as_str()) == Some("text")
                             && msg.tool_calls.is_none()
                         {
-                            blocks.into_iter().next().unwrap()
+                            blocks.into_iter().next().unwrap_or(serde_json::Value::String(msg.content.clone()))
                         } else {
                             serde_json::Value::Array(blocks)
                         }),
@@ -302,6 +295,13 @@ impl AnthropicClient {
                             "tool_use_id": tool_id,
                             "content": msg.content
                         }])),
+                    });
+                }
+                _ => {
+                    // Unknown role variants — treat as user message
+                    api_messages.push(ApiMessage {
+                        role: "user".to_string(),
+                        content: Some(serde_json::Value::String(msg.content.clone())),
                     });
                 }
             }
@@ -647,7 +647,12 @@ impl LlmClient for AnthropicClient {
                                                 }
                                             }
                                             ContentBlockDelta::InputJsonDelta { partial_json } => {
-                                                debug!("Tool input delta: {}", partial_json);
+                                                // Accumulate tool input fragments
+                                                if let Some(idx) = data_val.get("index").and_then(|v| v.as_u64()) {
+                                                    if let Some(entry) = pending_tool_calls.get_mut(&(idx as usize)) {
+                                                        entry.2.push_str(&partial_json);
+                                                    }
+                                                }
                                             }
                                             ContentBlockDelta::ThinkingDelta { thinking } => {
                                                 if !thinking.is_empty() {
@@ -667,7 +672,7 @@ impl LlmClient for AnthropicClient {
                             {
                                 let block = start.get("content_block");
                                 if block.and_then(|b| b.get("type")).and_then(|t| t.as_str()) == Some("tool_use") {
-                                    let cb = block.unwrap();
+                                    let cb = block.expect("just checked content_block exists for tool_use");
                                     let id = cb
                                         .get("id")
                                         .and_then(|v| v.as_str())

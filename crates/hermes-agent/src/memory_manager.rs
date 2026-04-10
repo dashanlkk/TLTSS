@@ -36,6 +36,7 @@ const BLOCKED_PATTERNS: &[&str] = &[
 /// Memory target: MEMORY.md or USER.md
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum MemoryTarget {
     Memory,
     User,

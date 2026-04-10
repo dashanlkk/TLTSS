@@ -17,10 +17,17 @@ pub fn create_backend(
     }
 }
 
-/// 创建 Docker 后端并指定镜像
-pub fn create_docker_backend(
-    image: &str,
+/// 根据配置创建终端后端（带可选 Docker 镜像）
+pub fn create_backend_with_config(
+    backend_type: &str,
+    docker_image: Option<&str>,
     working_dir: &std::path::Path,
 ) -> Arc<dyn TerminalBackend> {
-    Arc::new(DockerBackend::new(image, working_dir.to_path_buf()))
+    match backend_type {
+        "docker" => {
+            let image = docker_image.unwrap_or("alpine:latest");
+            Arc::new(DockerBackend::new(image, working_dir.to_path_buf()))
+        }
+        _ => Arc::new(LocalBackend::new(working_dir.to_path_buf())),
+    }
 }

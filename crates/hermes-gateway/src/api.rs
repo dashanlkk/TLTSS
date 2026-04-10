@@ -1,6 +1,7 @@
 use axum::{
     extract::State,
     http::StatusCode,
+    middleware,
     response::{
         sse::{Event as SseAxumEvent, Sse},
         Json,
@@ -69,12 +70,13 @@ impl AppState {
     }
 }
 
-/// 构建 Axum Router
+/// 构建 Axum Router（含 Bearer token 认证中间件）
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/gateway/message", post(handle_message))
         .route("/api/gateway/health", get(handle_health))
         .route("/api/gateway/stream", get(handle_sse_stream))
+        .layer(middleware::from_fn(crate::auth::auth_middleware))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

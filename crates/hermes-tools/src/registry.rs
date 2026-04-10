@@ -141,6 +141,7 @@ impl ToolRegistry {
                 }
             }
             ApprovalLevel::AutoApprove => {}
+            _ => {}
         }
 
         // 也检查 context 中的审批级别
@@ -177,9 +178,18 @@ impl ToolRegistry {
                 }
             }
             ApprovalLevel::AutoApprove => {}
+            _ => {}
         }
 
-        handler.execute(arguments, context).await
+        let result = handler.execute(arguments, context).await?;
+
+        // 过滤工具输出中的敏感环境变量值
+        let filtered_content = hermes_security::env_filter::filter_sensitive(&result.content);
+        Ok(ToolResult {
+            tool_call_id: result.tool_call_id,
+            content: filtered_content,
+            is_error: result.is_error,
+        })
     }
 }
 

@@ -8,6 +8,7 @@ hermes-cfg = { path = "../hermes-cfg" }
 hermes-core = { path = "../hermes-core" }
 hermes-llm = { path = "../hermes-llm" }
 hermes-tools = { path = "../hermes-tools" }
+hermes-security = { path = "../hermes-security" }
 hermes-mcp = { path = "../hermes-mcp" }
 hermes-skill = { path = "../hermes-skill" }
 hermes-cron = { path = "../hermes-cron" }
@@ -22,3 +23,4 @@ uuid = { workspace = true }
 futures = { workspace = true }
 rand = "0.9"
 dirs = { workspace = true }
+tempfile = { workspace = true }

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 /// 消息来源平台枚举
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Platform {
     Cli,
     Telegram,

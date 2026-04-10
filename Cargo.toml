@@ -32,6 +32,7 @@ serde_yaml = "0.9"
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 futures = "0.3"
+futures-core = "0.3"
 
 # Error handling
 thiserror = "2"
@@ -73,3 +74,9 @@ reedline = "0.38"
 axum = { version = "0.8", features = ["json"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
+
+# Base64 encoding
+base64 = "0.22"
+
+# Testing
+tempfile = "3"

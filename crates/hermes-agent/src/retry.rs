@@ -9,6 +9,7 @@ use rand::Rng;
 
 /// Recovery strategy derived from error classification
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RecoveryStrategy {
     /// Retry immediately (transient issue that may resolve)
     Retry,
@@ -80,6 +81,7 @@ pub fn classify_error(error: &LlmError) -> RecoveryStrategy {
             }
         }
         LlmError::ContextLengthExceeded => RecoveryStrategy::Compress,
+        _ => RecoveryStrategy::Backoff, // Unknown error variants
     }
 }
 
@@ -192,6 +194,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hermes_cfg::traits::StreamEvent;
+    use std::pin::Pin;
 
     #[test]
     fn test_classify_rate_limit() {
@@ -282,5 +286,211 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+    }
+
+    // ── Additional edge case tests ──────────────────────────────
+
+    #[test]
+    fn test_classify_timeout() {
+        let err = LlmError::Timeout;
+        assert_eq!(classify_error(&err), RecoveryStrategy::Backoff);
+    }
+
+    #[test]
+    fn test_classify_connection_reset() {
+        let err = LlmError::ConnectionFailed("connection reset by peer".into());
+        assert_eq!(classify_error(&err), RecoveryStrategy::Retry);
+    }
+
+    #[test]
+    fn test_classify_connection_broken_pipe() {
+        let err = LlmError::ConnectionFailed("broken pipe".into());
+        assert_eq!(classify_error(&err), RecoveryStrategy::Retry);
+    }
+
+    #[test]
+    fn test_classify_connection_other() {
+        let err = LlmError::ConnectionFailed("refused".into());
+        assert_eq!(classify_error(&err), RecoveryStrategy::Backoff);
+    }
+
+    #[test]
+    fn test_classify_provider_billing_failover() {
+        let err = LlmError::ProviderError("billing issue".into());
+        assert_eq!(classify_error(&err), RecoveryStrategy::Failover);
+    }
+
+    #[test]
+    fn test_classify_provider_balance_failover() {
+        let err = LlmError::ProviderError("insufficient balance".into());
+        assert_eq!(classify_error(&err), RecoveryStrategy::Failover);
+    }
+
+    #[test]
+    fn test_classify_provider_502() {
+        let err = LlmError::ProviderError("502 Bad Gateway".into());
+        assert_eq!(classify_error(&err), RecoveryStrategy::Backoff);
+    }
+
+    #[test]
+    fn test_classify_provider_503() {
+        let err = LlmError::ProviderError("503 Service Unavailable".into());
+        assert_eq!(classify_error(&err), RecoveryStrategy::Backoff);
+    }
+
+    #[test]
+    fn test_classify_provider_overloaded() {
+        let err = LlmError::ProviderError("server overloaded".into());
+        assert_eq!(classify_error(&err), RecoveryStrategy::Backoff);
+    }
+
+    #[test]
+    fn test_classify_provider_400() {
+        let err = LlmError::ProviderError("400 Bad Request".into());
+        assert_eq!(classify_error(&err), RecoveryStrategy::Abort);
+    }
+
+    #[test]
+    fn test_classify_provider_invalid() {
+        let err = LlmError::ProviderError("invalid request body".into());
+        assert_eq!(classify_error(&err), RecoveryStrategy::Abort);
+    }
+
+    #[test]
+    fn test_classify_provider_default_backoff() {
+        let err = LlmError::ProviderError("unknown transient issue".into());
+        assert_eq!(classify_error(&err), RecoveryStrategy::Backoff);
+    }
+
+    #[test]
+    fn test_classify_stream_error_timeout() {
+        let err = LlmError::StreamError("read timeout".into());
+        assert_eq!(classify_error(&err), RecoveryStrategy::Backoff);
+    }
+
+    #[test]
+    fn test_classify_stream_error_other() {
+        let err = LlmError::StreamError("connection lost".into());
+        assert_eq!(classify_error(&err), RecoveryStrategy::Retry);
+    }
+
+    #[test]
+    fn test_classify_context_length_exceeded() {
+        let err = LlmError::ContextLengthExceeded;
+        assert_eq!(classify_error(&err), RecoveryStrategy::Compress);
+    }
+
+    #[test]
+    fn test_classify_too_many_tokens_variants() {
+        assert_eq!(
+            classify_error(&LlmError::ProviderError("too many tokens".into())),
+            RecoveryStrategy::Compress
+        );
+        assert_eq!(
+            classify_error(&LlmError::ProviderError("context_length".into())),
+            RecoveryStrategy::Compress
+        );
+        assert_eq!(
+            classify_error(&LlmError::ProviderError("maximum context exceeded".into())),
+            RecoveryStrategy::Compress
+        );
+        assert_eq!(
+            classify_error(&LlmError::ProviderError("request too large".into())),
+            RecoveryStrategy::Compress
+        );
+    }
+
+    #[test]
+    fn test_classify_rate_limit_as_429() {
+        let err = LlmError::ProviderError("429 Too Many Requests".into());
+        assert_eq!(classify_error(&err), RecoveryStrategy::Backoff);
+    }
+
+    #[test]
+    fn test_classify_rate_limit_text() {
+        let err = LlmError::ProviderError("rate limit exceeded".into());
+        assert_eq!(classify_error(&err), RecoveryStrategy::Backoff);
+    }
+
+    #[test]
+    fn test_classify_quota_text() {
+        let err = LlmError::ProviderError("quota exceeded".into());
+        assert_eq!(classify_error(&err), RecoveryStrategy::Backoff);
+    }
+
+    #[tokio::test]
+    async fn test_retry_max_retries_exhausted() {
+        let result = retry_llm_call(2, || async {
+            Err(LlmError::ConnectionFailed("always fails".into()))
+        })
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_retry_compress_strategy_returns_error() {
+        let result = retry_llm_call(3, || async {
+            Err(LlmError::ContextLengthExceeded)
+        })
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_retry_failover_strategy_returns_error() {
+        let result = retry_llm_call(3, || async {
+            Err(LlmError::ProviderError("billing error".into()))
+        })
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_retry_stream_call_succeeds() {
+        use futures::stream::{self, Stream};
+
+        let result: Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, LlmError>> + Send>>, LlmError> =
+            retry_stream_call(3, || async {
+                Ok(Box::pin(stream::iter(vec![Ok(StreamEvent::Delta("hi".into()))])) as Pin<Box<dyn Stream<Item = Result<StreamEvent, LlmError>> + Send>>)
+            })
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_retry_stream_call_retries() {
+        use futures::stream::{self, Stream};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let count = Arc::new(AtomicU32::new(0));
+        let count_clone = count.clone();
+
+        let result: Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, LlmError>> + Send>>, LlmError> =
+            retry_stream_call(3, move || {
+                let c = count_clone.clone();
+                async move {
+                    let n = c.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        Err(LlmError::ConnectionFailed("fail".into()))
+                    } else {
+                        Ok(Box::pin(stream::iter(vec![Ok(StreamEvent::Done)])) as Pin<Box<dyn Stream<Item = Result<StreamEvent, LlmError>> + Send>>)
+                    }
+                }
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_jittered_backoff_minimum() {
+        let d = jittered_backoff(1, Duration::from_secs(1), Duration::from_secs(60));
+        assert!(d >= Duration::from_secs(1));
     }
 }

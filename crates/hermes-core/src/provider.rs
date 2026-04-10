@@ -34,6 +34,7 @@ pub struct ProviderConfig {
 /// Provider type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum ProviderType {
     Openai,
     Anthropic,

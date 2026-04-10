@@ -195,6 +195,9 @@ fn build_provider_client(cfg: &ProviderConfig) -> Arc<dyn hermes_cfg::traits::Ll
                     .with_temperature(cfg.temperature),
             )
         }
+        _ => {
+            Arc::new(hermes_llm::FakeClient::new("Unsupported provider type."))
+        }
     }
 }
 
@@ -245,16 +248,19 @@ fn create_llm_client(config: &AppConfig, provider_name: Option<&str>) -> Arc<dyn
         .collect();
 
     if !other_providers.is_empty() {
-        // Use the first non-primary as fallback
-        if let Some(fallback_cfg) = registry.get(&other_providers[0]) {
-            if !fallback_cfg.api_key.as_deref().unwrap_or("").is_empty() {
-                let fallback_client = build_provider_client(fallback_cfg);
+        // Use the first non-primary provider for fallback/routing
+        if let Some(other_cfg) = registry.get(&other_providers[0]) {
+            if !other_cfg.api_key.as_deref().unwrap_or("").is_empty() {
+                let other_client = build_provider_client(other_cfg);
                 tracing::info!(
-                    "Fallback provider: '{}' (model: {}) — wrapping in FallbackClient",
-                    other_providers[0], fallback_cfg.model
+                    "Secondary provider: '{}' (model: {})",
+                    other_providers[0], other_cfg.model
                 );
+
+                // Wrap in FallbackClient for resilience, then in RoutingClient for smart routing
+                let fallback = hermes_llm::FallbackClient::new(primary, other_client);
                 return Arc::new(
-                    hermes_llm::FallbackClient::new(primary, fallback_client)
+                    hermes_llm::RoutingClient::new(Arc::new(fallback))
                 );
             }
         }
@@ -267,11 +273,12 @@ fn create_llm_client(config: &AppConfig, provider_name: Option<&str>) -> Arc<dyn
 async fn create_tool_registry(
     config: &AppConfig,
     terminal: Arc<dyn hermes_cfg::traits::TerminalBackend>,
+    data_dir: &std::path::Path,
 ) -> Arc<hermes_tools::ToolRegistry> {
     let registry = Arc::new(hermes_tools::ToolRegistry::new());
     let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    // 注册内置工具
+    // 注册基础内置工具 (builtin.rs × 8)
     registry
         .register(Arc::new(hermes_tools::builtin::ReadFileTool::new(&base_dir)))
         .await;
@@ -295,6 +302,29 @@ async fn create_tool_registry(
         .await;
     registry
         .register(Arc::new(hermes_tools::builtin::ClarifyTool::new()))
+        .await;
+
+    // 注册扩展内置工具 (builtin_ext.rs × 7)
+    registry
+        .register(Arc::new(hermes_tools::builtin_ext::WebSearchTool::new()))
+        .await;
+    registry
+        .register(Arc::new(hermes_tools::builtin_ext::WebExtractTool::new()))
+        .await;
+    registry
+        .register(Arc::new(hermes_tools::builtin_ext::SessionSearchTool::new(data_dir)))
+        .await;
+    registry
+        .register(Arc::new(hermes_tools::builtin_ext::SkillsListTool::new(skills_dir())))
+        .await;
+    registry
+        .register(Arc::new(hermes_tools::builtin_ext::SkillViewTool::new(skills_dir())))
+        .await;
+    registry
+        .register(Arc::new(hermes_tools::builtin_ext::VisionAnalyzeTool::new()))
+        .await;
+    registry
+        .register(Arc::new(hermes_tools::builtin_ext::PatchTool::new(&base_dir)))
         .await;
 
     // 注册 MCP 工具
@@ -328,7 +358,11 @@ async fn create_tool_registry(
 /// 创建终端后端
 fn create_terminal(config: &AppConfig) -> Arc<dyn hermes_cfg::traits::TerminalBackend> {
     let work_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    hermes_terminal::factory::create_backend(&config.terminal.backend, &work_dir)
+    hermes_terminal::factory::create_backend_with_config(
+        &config.terminal.backend,
+        config.terminal.docker_image.as_deref(),
+        &work_dir,
+    )
 }
 
 // ── 主入口 ────────────────────────────────────────────────────────
@@ -389,8 +423,15 @@ async fn run_chat(config: &AppConfig, tui: bool, stream: bool, one_shot: Option<
 
     let terminal = create_terminal(config);
     let llm = create_llm_client(config, provider);
-    let registry = create_tool_registry(config, terminal).await;
-    let memory = Arc::new(MemoryStore::new());
+    let data_dir = agent_data_dir();
+    let registry = create_tool_registry(config, terminal, &data_dir).await;
+    let memory = Arc::new(
+        MemoryStore::new().with_data_dir(data_dir.join("tfidf_memory"))
+    );
+
+    // 初始化 MemoryManager（文件持久化记忆）
+    let memory_mgr = Arc::new(hermes_agent::MemoryManager::new(data_dir.join("memories")));
+    memory_mgr.initialize().await?;
 
     // 注册 delegate_task 工具（需要 llm + registry + memory）
     registry
@@ -447,10 +488,35 @@ async fn run_chat(config: &AppConfig, tui: bool, stream: bool, one_shot: Option<
                     .join(", ")
             }
         ),
+        data_dir: Some(data_dir),
         ..AgentConfig::default()
     };
 
-    let agent = Agent::new(agent_config, llm, registry, memory).with_skills(skill_manifests);
+    let agent = Agent::new(agent_config, llm, registry, memory)
+        .with_skills(skill_manifests)
+        .with_memory_manager(memory_mgr);
+
+    // 启动 Cron 后台调度器（连接 message handler 到 Agent）
+    let _cron_scheduler = {
+        let terminal = create_terminal(config);
+        let agent_clone = agent.clone_for_gateway();
+        let scheduler = hermes_cron::scheduler::Scheduler::new(terminal)
+            .with_data_dir(cron_data_dir());
+        let _ = scheduler.load_from_dir().await;
+        let scheduler = scheduler.with_message_handler(move |msg| {
+            let agent = agent_clone.clone_for_gateway();
+            async move {
+                agent
+                    .chat(&msg, hermes_cfg::platform::SessionSource::cron("cron-bg"))
+                    .await
+                    .map(|r| r.content)
+                    .map_err(|e| e.to_string())
+            }
+        });
+        scheduler.start().await;
+        tracing::info!("Cron scheduler started in background");
+        scheduler
+    };
 
     if let Some(msg) = one_shot {
         // 单次模式：发送消息，输出回复，退出
@@ -656,12 +722,18 @@ fn check_config(config: &AppConfig) -> anyhow::Result<()> {
         }
     }
 
-    // API key
-    let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-    if api_key.is_empty() {
-        issues.push("OPENAI_API_KEY not set (chat will use FakeClient)".to_string());
+    // API keys — check both Anthropic and OpenAI
+    let anthropic_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+    let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+    if anthropic_key.is_empty() && openai_key.is_empty() {
+        issues.push("No API key set (ANTHROPIC_API_KEY or OPENAI_API_KEY). Chat will use FakeClient.".to_string());
     } else {
-        ok_count += 1;
+        if !anthropic_key.is_empty() {
+            ok_count += 1;
+        }
+        if !openai_key.is_empty() {
+            ok_count += 1;
+        }
     }
 
     println!("Config validation:");
@@ -682,7 +754,7 @@ fn check_config(config: &AppConfig) -> anyhow::Result<()> {
 
 async fn list_tools(config: &AppConfig) -> anyhow::Result<()> {
     let terminal = create_terminal(config);
-    let registry = create_tool_registry(config, terminal).await;
+    let registry = create_tool_registry(config, terminal, &agent_data_dir()).await;
     let tools = registry.list().await;
 
     if tools.is_empty() {
@@ -698,6 +770,16 @@ async fn list_tools(config: &AppConfig) -> anyhow::Result<()> {
 }
 
 // ── Skills 命令 ───────────────────────────────────────────────────
+
+fn agent_data_dir() -> PathBuf {
+    if let Some(home) = dirs::home_dir() {
+        let dir = home.join(".hermes");
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    } else {
+        PathBuf::from(".hermes")
+    }
+}
 
 fn skills_dir() -> PathBuf {
     // 优先当前目录，其次用户主目录
@@ -731,6 +813,7 @@ fn list_skills() -> anyhow::Result<()> {
             let status = match skill.status {
                 hermes_skill::manifest::SkillStatus::Draft => "[draft]",
                 hermes_skill::manifest::SkillStatus::Published => "[published]",
+                _ => "[unknown]",
             };
             println!(
                 "  - {:20} {} {}  triggers: {}",
@@ -869,6 +952,7 @@ fn run_security_audit(path: Option<String>, prompt: Option<String>) -> anyhow::R
                     matched_pattern
                 );
             }
+            _ => println!("[UNKNOWN] Unexpected scan result"),
         }
     }
     if path.is_none() && prompt.is_none() {
@@ -882,50 +966,74 @@ fn run_security_audit(path: Option<String>, prompt: Option<String>) -> anyhow::R
 // ── Gateway 命令 ──────────────────────────────────────────────────
 
 async fn run_gateway(addr: &str) -> anyhow::Result<()> {
+    use hermes_agent::MemoryStore;
     use hermes_gateway::api::AppState;
-    use hermes_gateway::GatewayManager;
-    use tokio::sync::mpsc;
+    use hermes_gateway::{GatewayChannel, GatewayManager, GatewayRunner};
 
-    let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
-    let state = AppState::new(gateway_tx.clone());
+    // 创建 gateway 消息通道
+    let mut channel = GatewayChannel::new();
+    let sender = channel.sender();
+
+    let state = AppState::new(sender.clone());
 
     // 注册已配置的平台适配器
     let mut manager = GatewayManager::new();
 
     // API 适配器总是注册
-    manager.with_api(gateway_tx.clone());
+    manager.with_api(sender.clone());
 
     // Telegram（如果配置了 token）
     if let Ok(token) = std::env::var("TELEGRAM_BOT_TOKEN") {
-        manager.with_telegram(&token, gateway_tx.clone());
+        manager.with_telegram(&token, sender.clone());
         println!("Telegram adapter registered");
     }
 
     // Discord（如果配置了 token 和 channel）
-    if let (Ok(token), Ok(channel)) = (
+    if let (Ok(token), Ok(channel_id)) = (
         std::env::var("DISCORD_BOT_TOKEN"),
         std::env::var("DISCORD_CHANNEL_ID"),
     ) {
-        manager.with_discord(&token, &channel, gateway_tx.clone());
+        manager.with_discord(&token, &channel_id, sender.clone());
         println!("Discord adapter registered");
     }
 
     // Slack（如果配置了 token 和 channel）
-    if let (Ok(token), Ok(channel)) = (
+    if let (Ok(token), Ok(channel_id)) = (
         std::env::var("SLACK_BOT_TOKEN"),
         std::env::var("SLACK_CHANNEL_ID"),
     ) {
-        manager.with_slack(&token, &channel, gateway_tx.clone());
+        manager.with_slack(&token, &channel_id, sender.clone());
         println!("Slack adapter registered");
     }
 
+    // 初始化 Agent 组件
+    let config = AppConfig::default();
+    let terminal = create_terminal(&config);
+    let llm = create_llm_client(&config, None);
+    let data_dir = agent_data_dir();
+    let registry = create_tool_registry(&config, terminal, &data_dir).await;
+    let memory = Arc::new(MemoryStore::new());
+
     // 启动所有适配器
     manager.start_all().await?;
+
+    // 创建 GatewayRunner（连接 Agent 到消息通道）
+    let runner = Arc::new(GatewayRunner::new(llm, registry, memory, manager));
+
+    // 在后台运行消息处理循环
+    let runner_handle = tokio::spawn(async move {
+        if let Err(e) = runner.run(&mut channel).await {
+            tracing::error!("GatewayRunner error: {}", e);
+        }
+    });
 
     // 启动 HTTP 服务器
     println!("Starting gateway server on {}", addr);
     hermes_gateway::api::serve(state, addr)
         .await
         .map_err(|e| anyhow::anyhow!("Gateway server error: {}", e))?;
+
+    // 清理
+    runner_handle.abort();
     Ok(())
 }

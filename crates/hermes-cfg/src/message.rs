@@ -5,6 +5,7 @@ use uuid::Uuid;
 /// 对话角色枚举
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Role {
     System,
     User,

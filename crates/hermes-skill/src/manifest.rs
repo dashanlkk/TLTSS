@@ -16,6 +16,7 @@ pub struct SkillManifest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SkillStatus {
     #[default]
     Draft,

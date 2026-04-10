@@ -21,6 +21,7 @@ static INJECTION_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 
 /// Prompt 注入扫描结果
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ScanResult {
     Safe,
     Suspicious { matched_pattern: String },

@@ -10,5 +10,4 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
-schemars = { workspace = true }
-futures = { workspace = true }
+futures-core = { workspace = true }

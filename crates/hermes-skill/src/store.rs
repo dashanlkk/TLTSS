@@ -85,3 +85,136 @@ impl SkillStore {
         Ok(manifest)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_manifest(name: &str) -> SkillManifest {
+        SkillManifest {
+            name: name.to_string(),
+            version: "1.0".to_string(),
+            description: format!("Test skill {}", name),
+            trigger_patterns: vec!["test".to_string()],
+            steps: vec![],
+            status: SkillStatus::Draft,
+        }
+    }
+
+    #[test]
+    fn new_creates_store_with_given_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SkillStore::new(dir.path());
+        // Store should be usable even if directory does not exist yet
+        let skills = store.load_all();
+        assert!(skills.is_empty());
+    }
+
+    #[test]
+    fn load_all_returns_empty_for_nonexistent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let nonexistent = dir.path().join("does_not_exist");
+        let store = SkillStore::new(&nonexistent);
+        assert!(store.load_all().is_empty());
+    }
+
+    #[test]
+    fn save_and_find_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SkillStore::new(dir.path());
+
+        let manifest = sample_manifest("my_skill");
+        store.save(&manifest).unwrap();
+
+        let found = store.find("my_skill").unwrap();
+        assert_eq!(found.name, "my_skill");
+        assert_eq!(found.version, "1.0");
+        assert_eq!(found.description, "Test skill my_skill");
+    }
+
+    #[test]
+    fn find_returns_none_for_missing_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SkillStore::new(dir.path());
+        assert!(store.find("nonexistent").is_none());
+    }
+
+    #[test]
+    fn load_all_returns_saved_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SkillStore::new(dir.path());
+
+        store.save(&sample_manifest("skill_a")).unwrap();
+        store.save(&sample_manifest("skill_b")).unwrap();
+
+        let skills = store.load_all();
+        assert_eq!(skills.len(), 2);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"skill_a"));
+        assert!(names.contains(&"skill_b"));
+    }
+
+    #[test]
+    fn delete_removes_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SkillStore::new(dir.path());
+
+        store.save(&sample_manifest("to_delete")).unwrap();
+        assert!(store.find("to_delete").is_some());
+
+        store.delete("to_delete").unwrap();
+        assert!(store.find("to_delete").is_none());
+    }
+
+    #[test]
+    fn delete_nonexistent_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SkillStore::new(dir.path());
+        assert!(store.delete("ghost").is_ok());
+    }
+
+    #[test]
+    fn publish_changes_status_to_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SkillStore::new(dir.path());
+
+        store.save(&sample_manifest("pub_skill")).unwrap();
+        assert_eq!(store.find("pub_skill").unwrap().status, SkillStatus::Draft);
+
+        let published = store.publish("pub_skill").unwrap();
+        assert_eq!(published.status, SkillStatus::Published);
+
+        // Verify persistence
+        assert_eq!(store.find("pub_skill").unwrap().status, SkillStatus::Published);
+    }
+
+    #[test]
+    fn publish_returns_error_for_missing_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SkillStore::new(dir.path());
+        let result = store.publish("missing");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn save_creates_directory_if_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a").join("b").join("c");
+        let store = SkillStore::new(&nested);
+
+        assert!(!nested.exists());
+        store.save(&sample_manifest("nested_skill")).unwrap();
+        assert!(nested.exists());
+        assert!(store.find("nested_skill").is_some());
+    }
+
+    #[test]
+    fn load_all_ignores_non_yaml_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // Write a non-YAML file into the skills directory
+        std::fs::write(dir.path().join("readme.txt"), "not a skill").unwrap();
+
+        let store = SkillStore::new(dir.path());
+        assert!(store.load_all().is_empty());
+    }
+}

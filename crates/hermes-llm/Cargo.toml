@@ -13,5 +13,4 @@ reqwest = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-eventsource-stream = "0.2"
 async-stream = "0.3"

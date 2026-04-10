@@ -93,6 +93,7 @@ impl Default for ChildConfig {
 
 /// Delegation error types
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DelegationError {
     #[error("Maximum delegation depth ({max}) reached (current: {current})")]
     MaxDepthExceeded { current: u32, max: u32 },

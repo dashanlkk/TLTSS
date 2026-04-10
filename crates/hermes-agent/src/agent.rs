@@ -15,6 +15,7 @@ use crate::session::Session;
 use crate::trace::{TraceCollector, TraceEvent};
 use crate::compressor::{self, CompressionConfig};
 use crate::retry::{self, RecoveryStrategy};
+use hermes_tools::parallel::{should_parallelize, ToolCallInfo, MAX_TOOL_WORKERS};
 
 /// Agent 配置
 pub struct AgentConfig {
@@ -47,6 +48,7 @@ pub struct Agent {
     llm: Arc<dyn LlmClient>,
     registry: Arc<ToolRegistry>,
     memory: Arc<MemoryStore>,
+    memory_manager: Option<Arc<crate::memory_manager::MemoryManager>>,
     skills: Vec<SkillManifest>,
     sessions: RwLock<Vec<Session>>,
     trace: Arc<TraceCollector>,
@@ -64,6 +66,7 @@ impl Agent {
             llm,
             registry,
             memory,
+            memory_manager: None,
             skills: Vec::new(),
             sessions: RwLock::new(Vec::new()),
             trace: Arc::new(TraceCollector::new()),
@@ -73,6 +76,12 @@ impl Agent {
     /// 设置技能列表
     pub fn with_skills(mut self, skills: Vec<SkillManifest>) -> Self {
         self.skills = skills;
+        self
+    }
+
+    /// 设置 MemoryManager（文件持久化记忆）
+    pub fn with_memory_manager(mut self, mgr: Arc<crate::memory_manager::MemoryManager>) -> Self {
+        self.memory_manager = Some(mgr);
         self
     }
 
@@ -118,6 +127,19 @@ impl Agent {
             )
             .await;
 
+        // Prompt 注入扫描
+        if let hermes_security::prompt::ScanResult::Suspicious { matched_pattern } =
+            hermes_security::prompt::scan_prompt(user_message)
+        {
+            warn!("Prompt injection pattern detected: '{}'", matched_pattern);
+            let response = Message::new_assistant(
+                "I detected a potentially harmful pattern in your input. Please rephrase your request.",
+            );
+            session.push_message(response.clone());
+            self.persist_session(session).await;
+            return Ok(response);
+        }
+
         // 检查技能触发
         if let Some(skill_result) = self.try_skill_trigger(user_message, &source).await {
             self.trace.event(&trace_id, TraceEvent::Done).await;
@@ -130,8 +152,22 @@ impl Agent {
         // 检索相关记忆
         let memories = self.memory.search(user_message).await;
 
+        // 发现项目上下文文件 (.hermes.md / AGENTS.md / CLAUDE.md / .cursorrules)
+        let context_files = crate::context_files::discover_context_files(
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        );
+
         // 构建 prompt
-        let builder = PromptBuilder::new(&self.config.system_prompt).with_memories(memories);
+        let memory_context = if let Some(mgr) = &self.memory_manager {
+            mgr.build_memory_context_block().await
+        } else {
+            String::new()
+        };
+
+        let builder = PromptBuilder::new(&self.config.system_prompt)
+            .with_memories(memories)
+            .with_context_files(context_files)
+            .with_memory_context(memory_context);
         let messages = builder.build(&session.messages);
         self.trace
             .event(&trace_id, TraceEvent::PromptBuilt(messages.len()))
@@ -231,57 +267,87 @@ impl Agent {
 
                 debug!("Agent wants to call {} tool(s)", calls.len());
 
-                // 并行执行工具
+                // 并行/顺序执行决策
                 let ctx = ToolContext::new(&session.id, source.clone());
+                let call_infos: Vec<ToolCallInfo> = calls.iter().map(|c| ToolCallInfo {
+                    name: c.function.name.clone(),
+                    arguments: c.function.arguments.clone(),
+                }).collect();
+                let parallel = should_parallelize(&call_infos);
 
-                // 使用 JoinSet 并行执行
-                let mut join_set = tokio::task::JoinSet::new();
-                for call in calls {
-                    let registry = self.registry.clone();
-                    let ctx = ctx.clone();
-                    let tool_name = call.function.name.clone();
-                    join_set.spawn(async move {
-                        let result = registry
+                if parallel {
+                    // 安全并行：使用 JoinSet
+                    debug!("Parallel execution: {} tools", calls.len());
+                    let max_workers = calls.len().min(MAX_TOOL_WORKERS);
+                    let mut join_set = tokio::task::JoinSet::new();
+                    for call in calls.iter().take(max_workers) {
+                        let registry = self.registry.clone();
+                        let ctx = ctx.clone();
+                        let call_id = call.id.clone();
+                        let tool_name = call.function.name.clone();
+                        let args = call.function.arguments.clone();
+                        join_set.spawn(async move {
+                            let result = registry
+                                .execute(&tool_name, &args, &ctx)
+                                .await;
+                            (call_id, tool_name, result)
+                        });
+                    }
+
+                    while let Some(res) = join_set.join_next().await {
+                        match res {
+                            Ok((call_id, tool_name, result)) => match result {
+                                Ok(tool_result) => {
+                                    self.trace.event(&trace_id, TraceEvent::ToolExecuted {
+                                        tool: tool_name,
+                                        success: true,
+                                    }).await;
+                                    let msg = Message::new_tool_result(&call_id, &tool_result.content);
+                                    current_messages.push(msg.clone());
+                                    session.push_message(msg);
+                                }
+                                Err(e) => {
+                                    self.trace.event(&trace_id, TraceEvent::ToolExecuted {
+                                        tool: tool_name,
+                                        success: false,
+                                    }).await;
+                                    let msg = Message::new_tool_result(&call_id, e.to_string());
+                                    current_messages.push(msg.clone());
+                                    session.push_message(msg);
+                                }
+                            },
+                            Err(e) => {
+                                warn!("Tool task failed: {}", e);
+                            }
+                        }
+                    }
+                } else {
+                    // 顺序执行
+                    debug!("Sequential execution: {} tools", calls.len());
+                    for call in &calls {
+                        let tool_name = call.function.name.clone();
+                        let result = self.registry
                             .execute(&tool_name, &call.function.arguments, &ctx)
                             .await;
-                        (call.id.clone(), tool_name, result)
-                    });
-                }
-
-                while let Some(res) = join_set.join_next().await {
-                    match res {
-                        Ok((call_id, tool_name, result)) => match result {
+                        match result {
                             Ok(tool_result) => {
-                                self.trace
-                                    .event(
-                                        &trace_id,
-                                        TraceEvent::ToolExecuted {
-                                            tool: tool_name,
-                                            success: true,
-                                        },
-                                    )
-                                    .await;
-                                let msg = Message::new_tool_result(&call_id, &tool_result.content);
+                                self.trace.event(&trace_id, TraceEvent::ToolExecuted {
+                                    tool: tool_name,
+                                    success: true,
+                                }).await;
+                                let msg = Message::new_tool_result(&call.id, &tool_result.content);
                                 current_messages.push(msg.clone());
                                 session.push_message(msg);
                             }
                             Err(e) => {
-                                self.trace
-                                    .event(
-                                        &trace_id,
-                                        TraceEvent::ToolExecuted {
-                                            tool: tool_name,
-                                            success: false,
-                                        },
-                                    )
-                                    .await;
-                                let msg = Message::new_tool_result(&call_id, e.to_string());
+                                self.trace.event(&trace_id, TraceEvent::ToolExecuted {
+                                    tool: tool_name,
+                                    success: false,
+                                }).await;
+                                let msg = Message::new_tool_result(&call.id, e.to_string());
                                 current_messages.push(msg.clone());
                                 session.push_message(msg);
                             }
-                        },
-                        Err(e) => {
-                            warn!("Tool task failed: {}", e);
                         }
                     }
                 }
@@ -346,6 +412,20 @@ impl Agent {
             )
             .await;
 
+        // Prompt 注入扫描
+        if let hermes_security::prompt::ScanResult::Suspicious { matched_pattern } =
+            hermes_security::prompt::scan_prompt(user_message)
+        {
+            warn!("Prompt injection pattern detected: '{}'", matched_pattern);
+            let response = Message::new_assistant(
+                "I detected a potentially harmful pattern in your input. Please rephrase your request.",
+            );
+            on_token("I detected a potentially harmful pattern in your input. Please rephrase your request.");
+            session.push_message(response.clone());
+            self.persist_session(session).await;
+            return Ok(response);
+        }
+
         // 检查技能触发
         if let Some(skill_result) = self.try_skill_trigger(user_message, &source).await {
             self.trace.event(&trace_id, TraceEvent::Done).await;
@@ -356,7 +436,18 @@ impl Agent {
         }
 
         let memories = self.memory.search(user_message).await;
-        let builder = PromptBuilder::new(&self.config.system_prompt).with_memories(memories);
+        let context_files = crate::context_files::discover_context_files(
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        );
+        let memory_context = if let Some(mgr) = &self.memory_manager {
+            mgr.build_memory_context_block().await
+        } else {
+            String::new()
+        };
+        let builder = PromptBuilder::new(&self.config.system_prompt)
+            .with_memories(memories)
+            .with_context_files(context_files)
+            .with_memory_context(memory_context);
         let mut current_messages = builder.build(&session.messages);
         self.trace
             .event(&trace_id, TraceEvent::PromptBuilt(current_messages.len()))
@@ -464,6 +555,7 @@ impl Agent {
                         warn!("Stream error: {}", e);
                         break;
                     }
+                    Ok(_) => {} // Unknown StreamEvent variants
                 }
             }
 
@@ -491,23 +583,71 @@ impl Agent {
 
                 debug!("Stream: agent calls {} tool(s)", calls.len());
 
+                // 并行/顺序执行决策
                 let ctx = ToolContext::new(&session.id, source.clone());
-                let mut join_set = tokio::task::JoinSet::new();
-                for call in calls {
-                    let registry = self.registry.clone();
-                    let ctx = ctx.clone();
-                    let tool_name = call.function.name.clone();
-                    join_set.spawn(async move {
-                        let result = registry
+                let call_infos: Vec<ToolCallInfo> = calls.iter().map(|c| ToolCallInfo {
+                    name: c.function.name.clone(),
+                    arguments: c.function.arguments.clone(),
+                }).collect();
+                let parallel = should_parallelize(&call_infos);
+
+                if parallel {
+                    debug!("Stream parallel execution: {} tools", calls.len());
+                    let max_workers = calls.len().min(MAX_TOOL_WORKERS);
+                    let mut join_set = tokio::task::JoinSet::new();
+                    for call in calls.iter().take(max_workers) {
+                        let registry = self.registry.clone();
+                        let ctx = ctx.clone();
+                        let call_id = call.id.clone();
+                        let tool_name = call.function.name.clone();
+                        let args = call.function.arguments.clone();
+                        join_set.spawn(async move {
+                            let result = registry
+                                .execute(&tool_name, &args, &ctx)
+                                .await;
+                            (call_id, tool_name, result)
+                        });
+                    }
+
+                    while let Some(res) = join_set.join_next().await {
+                        match res {
+                            Ok((call_id, tool_name, result)) => match result {
+                                Ok(tool_result) => {
+                                    self.trace
+                                        .event(&trace_id, TraceEvent::ToolExecuted {
+                                            tool: tool_name,
+                                            success: true,
+                                        })
+                                        .await;
+                                    let msg = Message::new_tool_result(&call_id, &tool_result.content);
+                                    current_messages.push(msg.clone());
+                                    session.push_message(msg);
+                                }
+                                Err(e) => {
+                                    self.trace
+                                        .event(&trace_id, TraceEvent::ToolExecuted {
+                                            tool: tool_name,
+                                            success: false,
+                                        })
+                                        .await;
+                                    let msg = Message::new_tool_result(&call_id, e.to_string());
+                                    current_messages.push(msg.clone());
+                                    session.push_message(msg);
+                                }
+                            },
+                            Err(e) => {
+                                warn!("Stream tool task failed: {}", e);
+                            }
+                        }
+                    }
+                } else {
+                    debug!("Stream sequential execution: {} tools", calls.len());
+                    for call in &calls {
+                        let tool_name = call.function.name.clone();
+                        let result = self.registry
                             .execute(&tool_name, &call.function.arguments, &ctx)
                             .await;
-                        (call.id.clone(), tool_name, result)
-                    });
-                }
-
-                while let Some(res) = join_set.join_next().await {
-                    match res {
-                        Ok((call_id, tool_name, result)) => match result {
+                        match result {
                             Ok(tool_result) => {
                                 self.trace
                                     .event(&trace_id, TraceEvent::ToolExecuted {
@@ -515,7 +655,7 @@ impl Agent {
                                         success: true,
                                     })
                                     .await;
-                                let msg = Message::new_tool_result(&call_id, &tool_result.content);
+                                let msg = Message::new_tool_result(&call.id, &tool_result.content);
                                 current_messages.push(msg.clone());
                                 session.push_message(msg);
                             }
@@ -526,13 +666,10 @@ impl Agent {
                                         success: false,
                                     })
                                     .await;
-                                let msg = Message::new_tool_result(&call_id, e.to_string());
+                                let msg = Message::new_tool_result(&call.id, e.to_string());
                                 current_messages.push(msg.clone());
                                 session.push_message(msg);
                             }
-                        },
-                        Err(e) => {
-                            warn!("Stream tool task failed: {}", e);
                         }
                     }
                 }
@@ -634,6 +771,7 @@ impl Agent {
             llm: self.llm.clone(),
             registry: self.registry.clone(),
             memory: self.memory.clone(),
+            memory_manager: self.memory_manager.clone(),
             skills: self.skills.clone(),
             sessions: RwLock::new(Vec::new()),
             trace: Arc::new(TraceCollector::new()),
@@ -805,5 +943,198 @@ steps:
         let response = agent.chat("please echo something", SessionSource::cli()).await.unwrap();
         assert!(response.content.contains("test_echo"));
         assert!(response.content.contains("echo ok"));
+    }
+
+    // ── Edge case tests ──────────────────────────────────────────────
+
+    /// Helper: create an agent with a tool-calling FakeClient
+    fn make_tool_calling_agent(
+        response_text: &str,
+        tool_call_sequence: Vec<Vec<hermes_cfg::tool::ToolCall>>,
+        config: AgentConfig,
+    ) -> (Agent, Arc<MemoryStore>) {
+        let llm = Arc::new(
+            hermes_llm::FakeClient::new(response_text)
+                .with_tool_calls_sequence(tool_call_sequence),
+        );
+        let registry = Arc::new(ToolRegistry::new());
+        let memory = Arc::new(MemoryStore::new());
+        let agent = Agent::new(config, llm, registry, memory.clone());
+        (agent, memory)
+    }
+
+    /// Helper: register a no-op tool by name
+    async fn register_noop_tool(registry: &Arc<ToolRegistry>, name: &str) {
+        struct Noop(String);
+        #[async_trait::async_trait]
+        impl hermes_cfg::traits::ToolHandler for Noop {
+            fn name(&self) -> &str { &self.0 }
+            fn description(&self) -> &str { "Noop" }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(
+                &self,
+                _args: &str,
+                _ctx: &hermes_cfg::traits::ToolContext,
+            ) -> Result<hermes_cfg::tool::ToolResult, hermes_cfg::error::ToolError> {
+                Ok(hermes_cfg::tool::ToolResult::success(&self.0, "ok"))
+            }
+        }
+        registry.register(Arc::new(Noop(name.to_string()))).await;
+    }
+
+    fn make_tool_call(name: &str, args: &str) -> hermes_cfg::tool::ToolCall {
+        hermes_cfg::tool::ToolCall {
+            id: format!("call_{}", name),
+            call_type: "function".to_string(),
+            function: hermes_cfg::tool::FunctionCall {
+                name: name.to_string(),
+                arguments: args.to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_agent_chat_with_tool_calls() {
+        let config = AgentConfig::default();
+        let (agent, _) = make_tool_calling_agent(
+            "Done",
+            vec![vec![make_tool_call("noop", "{}")]],
+            config,
+        );
+        register_noop_tool(&agent.registry, "noop").await;
+
+        let response = agent.chat("use noop tool", SessionSource::cli()).await.unwrap();
+        assert_eq!(response.content, "Done");
+
+        let sessions = agent.list_sessions().await;
+        // user + assistant(tool_call) + tool_result + assistant(final) = 4
+        assert_eq!(sessions[0].messages.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_agent_max_iterations() {
+        let config = AgentConfig {
+            max_iterations: 1,
+            ..AgentConfig::default()
+        };
+        let llm = Arc::new(hermes_llm::FakeClient::new("Response"));
+        let registry = Arc::new(ToolRegistry::new());
+        let memory = Arc::new(MemoryStore::new());
+        let agent = Agent::new(config, llm, registry, memory);
+
+        // max_iterations=1 means only 1 LLM call; should return normally
+        let response = agent.chat("test", SessionSource::cli()).await.unwrap();
+        assert_eq!(response.content, "Response");
+    }
+
+    #[tokio::test]
+    async fn test_agent_max_tool_rounds() {
+        let config = AgentConfig {
+            max_tool_rounds: 1,
+            max_iterations: 90,
+            ..AgentConfig::default()
+        };
+
+        // FakeClient will always return tool_calls (even after tool results)
+        let llm = Arc::new(
+            hermes_llm::FakeClient::new("Final")
+                .with_tool_calls_sequence(vec![
+                    vec![make_tool_call("noop", "{}")],
+                    // After round 1, the tool_call sequence is exhausted,
+                    // so the next call returns plain text "Final"
+                ]),
+        );
+        let registry = Arc::new(ToolRegistry::new());
+        let memory = Arc::new(MemoryStore::new());
+        let agent = Agent::new(config, llm, registry, memory);
+        register_noop_tool(&agent.registry, "noop").await;
+
+        let response = agent.chat("test", SessionSource::cli()).await.unwrap();
+        // Should complete after 1 tool round + 1 final text response
+        assert_eq!(response.content, "Final");
+    }
+
+    #[tokio::test]
+    async fn test_agent_empty_message() {
+        let llm = Arc::new(hermes_llm::FakeClient::new("Reply"));
+        let registry = Arc::new(ToolRegistry::new());
+        let memory = Arc::new(MemoryStore::new());
+        let agent = Agent::new(AgentConfig::default(), llm, registry, memory);
+
+        let response = agent.chat("", SessionSource::cli()).await.unwrap();
+        assert_eq!(response.content, "Reply");
+    }
+
+    #[tokio::test]
+    async fn test_agent_stream_with_tool_calls() {
+        let config = AgentConfig::default();
+        let llm = Arc::new(
+            hermes_llm::FakeClient::new("Final answer")
+                .with_tool_calls_sequence(vec![
+                    vec![make_tool_call("noop", "{}")],
+                ]),
+        );
+        let registry = Arc::new(ToolRegistry::new());
+        let memory = Arc::new(MemoryStore::new());
+        let agent = Agent::new(config, llm, registry, memory);
+        register_noop_tool(&agent.registry, "noop").await;
+
+        let mut tokens = Vec::new();
+        let response = agent
+            .chat_stream("use tool", SessionSource::cli(), |t| {
+                tokens.push(t.to_string());
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.content, "Final answer");
+        let sessions = agent.list_sessions().await;
+        // user + assistant(tool_call) + tool_result + assistant(final) = 4
+        assert_eq!(sessions[0].messages.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_agent_clone_for_gateway_isolation() {
+        let llm = Arc::new(hermes_llm::FakeClient::new("Reply"));
+        let registry = Arc::new(ToolRegistry::new());
+        let memory = Arc::new(MemoryStore::new());
+        let agent = Agent::new(AgentConfig::default(), llm, registry, memory);
+
+        // Chat on original agent
+        agent.chat("msg1", SessionSource::cli()).await.unwrap();
+        assert_eq!(agent.list_sessions().await.len(), 1);
+
+        // Clone should have empty sessions
+        let cloned = agent.clone_for_gateway();
+        assert_eq!(cloned.list_sessions().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_agent_multi_round_tool_calls() {
+        let config = AgentConfig {
+            max_tool_rounds: 10,
+            ..AgentConfig::default()
+        };
+        // 2 rounds of tool calls then a final text response
+        let llm = Arc::new(
+            hermes_llm::FakeClient::new("All done")
+                .with_tool_calls_sequence(vec![
+                    vec![make_tool_call("noop", "{}")],
+                    vec![make_tool_call("noop", "{}")],
+                ]),
+        );
+        let registry = Arc::new(ToolRegistry::new());
+        let memory = Arc::new(MemoryStore::new());
+        let agent = Agent::new(config, llm, registry, memory);
+        register_noop_tool(&agent.registry, "noop").await;
+
+        let response = agent.chat("multi-step task", SessionSource::cli()).await.unwrap();
+        assert_eq!(response.content, "All done");
+
+        let sessions = agent.list_sessions().await;
+        // user + asst(tool1) + tool_result + asst(tool2) + tool_result + asst(final) = 6
+        assert_eq!(sessions[0].messages.len(), 6);
     }
 }

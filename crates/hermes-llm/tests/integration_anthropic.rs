@@ -123,6 +123,7 @@ async fn test_anthropic_streaming() {
                         eprintln!("Stream error: {}", e);
                         break;
                     }
+                    Ok(_) => {} // Unknown StreamEvent variants
                 }
             }
 

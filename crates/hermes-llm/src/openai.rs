@@ -121,6 +121,7 @@ impl OpenAIClient {
                     Role::User => "user",
                     Role::Assistant => "assistant",
                     Role::Tool => "tool",
+                    _ => "user",
                 };
                 // 转换 tool_calls（assistant 消息可能携带工具调用）
                 let tool_calls = m.tool_calls.as_ref().map(|calls| {

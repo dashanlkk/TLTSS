@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::coerce;
+use crate::destructive::is_destructive_command;
 
 /// 内置工具：读取文件
 pub struct ReadFileTool {
@@ -84,6 +85,13 @@ impl ToolHandler for ExecuteCommandTool {
         let command = args["command"].as_str()
             .ok_or_else(|| ToolError::InvalidArguments("missing command".into()))?;
 
+        // Destructive command detection — reject if context is auto-approve
+        // and the command looks destructive (escalation is handled by the
+        // registry's approval system; here we just log a warning).
+        if is_destructive_command(command) {
+            tracing::warn!("Potentially destructive command detected: {}", command);
+        }
+
         let output = self.terminal.execute(command, None).await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
@@ -132,6 +140,10 @@ impl ToolHandler for WriteFileTool {
 
         let validated = validate_path(&self.base_dir, path)
             .map_err(|_| ToolError::PathTraversal)?;
+
+        if is_sensitive_file(path) {
+            return Err(ToolError::SensitiveFileAccess(path.to_string()));
+        }
 
         if let Some(parent) = validated.parent() {
             tokio::fs::create_dir_all(parent).await

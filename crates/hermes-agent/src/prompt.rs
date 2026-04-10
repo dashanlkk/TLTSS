@@ -1,11 +1,15 @@
 use hermes_cfg::message::Message;
 use hermes_skill::SkillManifest;
 
+use crate::context_files::ContextFile;
+
 /// Prompt 组装器：将系统提示、记忆、技能、对话历史组装为 messages 列表
 pub struct PromptBuilder {
     system_prompt: String,
     memories: Vec<String>,
     skills: Vec<SkillManifest>,
+    context_files: Vec<ContextFile>,
+    memory_context: String,
     max_context_messages: usize,
 }
 
@@ -15,6 +19,8 @@ impl PromptBuilder {
             system_prompt: system_prompt.into(),
             memories: Vec::new(),
             skills: Vec::new(),
+            context_files: Vec::new(),
+            memory_context: String::new(),
             max_context_messages: 50,
         }
     }
@@ -26,6 +32,16 @@ impl PromptBuilder {
 
     pub fn with_skills(mut self, skills: Vec<SkillManifest>) -> Self {
         self.skills = skills;
+        self
+    }
+
+    pub fn with_context_files(mut self, files: Vec<ContextFile>) -> Self {
+        self.context_files = files;
+        self
+    }
+
+    pub fn with_memory_context(mut self, ctx: String) -> Self {
+        self.memory_context = ctx;
         self
     }
 
@@ -41,7 +57,22 @@ impl PromptBuilder {
         // 系统提示
         let mut system_content = self.system_prompt.clone();
 
-        // 注入记忆
+        // 注入上下文文件 (.hermes.md / AGENTS.md / CLAUDE.md / .cursorrules)
+        if !self.context_files.is_empty() {
+            let block = crate::context_files::format_context_block(&self.context_files);
+            if !block.is_empty() {
+                system_content.push_str("\n\n");
+                system_content.push_str(&block);
+            }
+        }
+
+        // 注入 MemoryManager 持久化记忆 (MEMORY.md / USER.md)
+        if !self.memory_context.is_empty() {
+            system_content.push_str("\n\n");
+            system_content.push_str(&self.memory_context);
+        }
+
+        // 注入 TF-IDF 搜索记忆
         if !self.memories.is_empty() {
             system_content.push_str("\n\n## Memories\n");
             for mem in &self.memories {

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use futures::Stream;
+use futures_core::Stream;
 
 use crate::error::LlmError;
 use crate::message::Message;
@@ -35,6 +35,7 @@ use std::time::Duration;
 
 /// SSE 流式事件
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum StreamEvent {
     /// 增量文本 token
     Delta(String),
@@ -107,6 +108,7 @@ impl ToolContext {
 
 /// 工具审批权限级别
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ApprovalLevel {
     AutoApprove,
     RequireApproval,

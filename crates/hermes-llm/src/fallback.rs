@@ -60,6 +60,7 @@ impl FallbackClient {
                 // Default: try fallback
                 true
             }
+            _ => false,
         }
     }
 }

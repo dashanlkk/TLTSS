@@ -2,11 +2,9 @@
 
 pub mod config;
 pub mod env;
-pub mod permission;
 pub mod provider;
 pub mod sse;
 
 pub use config::AppConfig;
-pub use permission::ApprovalLevel;
 pub use provider::{ProviderConfig, ProviderRegistry, ProviderType};
 pub use sse::SseEvent;

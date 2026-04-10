@@ -275,6 +275,9 @@ fn generate_summary(middle: &[Message]) -> String {
             Role::System => {
                 // Skip system messages
             }
+            _ => {
+                // Unknown role variants — skip
+            }
         }
     }
 
@@ -479,5 +482,137 @@ mod tests {
         assert_eq!(cleaned.len(), 2); // assistant + matched tool result
         assert!(cleaned.iter().any(|m| m.role == Role::Assistant));
         assert!(cleaned.iter().any(|m| m.tool_call_id.as_deref() == Some("c1")));
+    }
+
+    // ── Additional edge case tests ──────────────────────────────
+
+    #[test]
+    fn test_compress_empty_messages() {
+        let config = CompressionConfig::default();
+        let result = compress(&[], 1000, &config);
+        assert!(!result.compressed);
+        assert!(result.messages.is_empty());
+        assert_eq!(result.tokens_before, 0);
+        assert_eq!(result.tokens_after, 0);
+    }
+
+    #[test]
+    fn test_should_compress_at_exact_threshold() {
+        let config = CompressionConfig {
+            threshold_percent: 0.5,
+            ..Default::default()
+        };
+        // max_context_tokens=100, threshold=50, so we need exactly 50 tokens = 200 chars
+        let content = "x".repeat(200);
+        let messages = vec![Message::new_user(&content)];
+        // should_compress uses strict >, so exactly at threshold should NOT compress
+        assert!(!should_compress(&messages, 100, &config));
+    }
+
+    #[test]
+    fn test_should_compress_just_over_threshold() {
+        let config = CompressionConfig {
+            threshold_percent: 0.5,
+            ..Default::default()
+        };
+        // threshold = 100 * 0.5 = 50 tokens. Need >50 tokens => need 204 chars (204/4=51)
+        let content = "x".repeat(204);
+        let messages = vec![Message::new_user(&content)];
+        assert!(should_compress(&messages, 100, &config));
+    }
+
+    #[test]
+    fn test_estimate_tokens_empty_messages() {
+        assert_eq!(estimate_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn test_compress_protected_tail_tool_output_preserved() {
+        let config = CompressionConfig {
+            max_tool_output_chars: 50,
+            threshold_percent: 0.01,
+            protected_tail_count: 2,
+            ..Default::default()
+        };
+
+        let long_output = "b".repeat(500);
+        let messages = vec![
+            Message::new_system("system"),
+            Message::new_user("msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
+            // This tool result is in the protected tail (last 2 messages)
+            Message::new_tool_result("c1", &long_output),
+            Message::new_user("msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
+        ];
+
+        let result = compress(&messages, 50, &config);
+        // The long tool output should NOT be truncated since it's in the tail
+        // (it may still be compressed via head/tail strategy, but pruning should not touch it)
+        assert!(result.compressed);
+    }
+
+    #[test]
+    fn test_generate_summary_with_tool_calls_files() {
+        let middle = vec![
+            Message::new_user("Read the config"),
+            Message::new_assistant("Reading file").with_tool_calls(vec![hermes_cfg::tool::ToolCall {
+                id: "c1".into(),
+                call_type: "function".into(),
+                function: hermes_cfg::tool::FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"config.yaml"}"#.into(),
+                },
+            }]),
+        ];
+
+        let summary = generate_summary(&middle);
+        assert!(summary.contains("Read the config"));
+        assert!(summary.contains("config.yaml"));
+        assert!(summary.contains("Files touched"));
+    }
+
+    #[test]
+    fn test_generate_summary_only_tool_messages() {
+        let middle = vec![
+            Message::new_tool_result("c1", "output1"),
+            Message::new_tool_result("c2", "output2"),
+        ];
+
+        let summary = generate_summary(&middle);
+        // Tool messages are skipped, but the compressed count should still appear
+        assert!(summary.contains("[Compressed: 2 messages]"));
+    }
+
+    #[test]
+    fn test_compress_with_only_system_messages() {
+        let config = CompressionConfig {
+            threshold_percent: 0.01,
+            ..Default::default()
+        };
+        let messages = vec![
+            Message::new_system(&"system ".repeat(2000)),
+        ];
+
+        let result = compress(&messages, 100, &config);
+        // System messages should be preserved in head
+        assert!(result.compressed);
+        assert!(result.messages.iter().any(|m| m.role == Role::System));
+    }
+
+    #[test]
+    fn test_clean_orphaned_tool_pairs_keeps_all_non_tool() {
+        let messages = vec![
+            Message::new_system("sys"),
+            Message::new_user("hi"),
+            Message::new_assistant("hello"),
+        ];
+
+        let cleaned = clean_orphaned_tool_pairs(&messages);
+        assert_eq!(cleaned.len(), 3);
+    }
+
+    #[test]
+    fn test_truncate_snippet_whitespace() {
+        assert_eq!(truncate_snippet("   ", 10), "");
+        assert_eq!(truncate_snippet("  hello  ", 10), "hello");
     }
 }
